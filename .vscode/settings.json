@@ -1,0 +1,12 @@
+{
+    "editor.quickSuggestions": {
+
+        "other": "off",
+        "comments": "off",
+        "strings": "off"
+    },
+    "cSpell.enabled": true,
+    "cSpell.enableFiletypes": [
+        "vasmmot"
+    ]
+}
