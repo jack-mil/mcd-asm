@@ -13,6 +13,7 @@ SPACE:      EQU     $20     ; Space
 NUL:        EQU     $00     ; Null
 CTRL_A:     EQU     $01     ; Quits line editing
 CTRL_C:     EQU     $03     ; Quits line editing
+CTRL_L:     EQU     $0C     ; Clear console
 EOT:        EQU     $04     ; End-of-Transmission ctrl^d
 
 * -- Device addresses -- *
@@ -24,7 +25,7 @@ STACK:      EQU     $020000     ; Location of stack (grows up from bottom of RAM
 MAXCHR:     EQU     64          ; Length (bytes) of input line buffer
 
 * Data and global variable definition
-DATA:       EQU     RAM+$C00    ; Data origin
+DATA:       EQU     RAM         ; Data origin
 LNBUFF:     DS.B    MAXCHR      ; Input line buffer
 BUFFEND:    EQU     LNBUFF+MAXCHR-1 ; end of line buffer
 BUFFPT:     DS.L    1           ; Pointer to line buffer
@@ -36,7 +37,7 @@ REG_F:      DS.W    37          ; Frame for D0-D7, A0-A6, USP, SSP, SR, PC
 
 * -- Simulator select bit -- *
 sim:        EQU     $1          ; 1 -> simulator / 0 -> hardware
-
+            OPT     SEX
 
 * ---------------------- *
 *       RESET START      *
@@ -291,12 +292,12 @@ EXECUTE:
         bsr     SEARCH
         bcs     .exec           ; If found then execute command
         lea     ER_INV(PC),A1   ; Else print invalid message
-        bra     PRINT_STR       ; and return
+        bra     PRINT_STR       ; and tail return
 
 .exec   move.l  (A3),A3         ; Get relative command address
         lea     COMTAB(PC),A4   ; pointed to by A3 and add it to
-        add.l   A4,A3           ; The PC to generate the actual
-        jmp     (A3)            ; command address. Then execute it.
+        add.l   A4,A3           ; the command table location to generate the actual
+        jmp     (A3)            ; command address. Then execute it. (RTS provided)
 
 * -- SEARCH -- *
 * Recursively search through entries in the  command table
@@ -341,7 +342,7 @@ SEARCH:
 * Resulting converted longword is placed in PARAMTR(A6) and D1
 * Sets D7 bit 1 if conversion error occurs
 PARAM:
-        move.l  D2,-(SP)        ; Save state
+        movem.l  D2/A0,-(SP)    ; Save state
         clr.l   D2              ; Clear input accumulator
         move.l  BUFFPT(A6),A0   ; Get pointer to first parameter in A0
 
@@ -368,7 +369,7 @@ PARAM:
         bra     .end            ; Return without error
 
 .error  or.b    #2,D7           ; Set error flag before return
-.end    move.l  (SP)+,D2        ; Restore state
+.end    movem.l  (SP)+,D2/A0    ; Restore state
         rts                     ; return (with error if set)
 
 * ------------------ *
@@ -456,11 +457,21 @@ MEM_DAT:
         move.l  A3,D1           ; Load A3 into input for output longword routine
         bsr     OUT8X           ; Print 8 nybbles (4 bytes, long word)
         bsr     P_SPACE         ; Print single space
-        move.b  (A3),D1         ; Move byte data at this address into D1
+        move.b  (A3)+,D1        ; Move byte data at this address into D1
         bsr     OUT2X           ; and display it
-        lea     1(A3),A3        ; Point to next address to display
         move.l  (SP)+,D1        ; Restore state
         rts                     ; and return
+
+P_ADDR:
+* Print the nicely formatted address in A3
+* Does not modify A3
+        move.l  A3,D1       ; Copy A3 into register for printing
+    IF.L D1 <LT> #$10000 THEN
+        bsr     OUT4X
+    ELSE
+        bsr     OUT8X
+    ENDI
+        rts
 
 P_SPACE:
 * Prints a single space
@@ -482,7 +493,26 @@ HELP:
         lea     HLP_MSG(PC),A1  ; Load help message string
         bra     PRINT_STR       ; and tail return
 
-* -- MEMORY -- *
+CLEAR:
+        move.b  #CTRL_L,D1      ; Load CTRL-L char in D1
+        bra     PUT_CHAR        ; Send character
+
+* -- JUMP -- *
+* Jump causes execution to begin at the address specified
+* Syntax JUMP <address>
+JUMP:
+        bsr     PARAM           ; Get address from command buffer
+        tst.b   D7              ; Test for error bit set
+        bne     .exit           ; If error flag not 0, exit with error
+        tst.l   D1              ; Else test for missing argument
+        beq     .exit           ; If no address provided, exit with error
+        move.l  D1,A0           ; Otherwise load A0 with address
+        jmp     (A0)            ; and call the subroutine. USER to provide RTS!!
+.exit   lea     ER_HEX(PC),A1   ; If error,load error message,
+        bra     PRINT_STR       ; print and tail return
+
+
+* -- MEMORY MODIFY -- *
 * Display data at a location specified in parameter
 * Syntax: MM <address>
 MEM_MOD:
@@ -517,7 +547,83 @@ MEM_MOD:
         bra     .loop           ; Repeat until <ESC>
 .exit   rts
 
+* -- MEMORY DUMP -- *
+* Hex Dump a block of data in memory
+* Each line has 16 bytes and the corresponding ascii characters
+* Starting address is aligned to 16 bytes
+* C020    31 32 33 34 35 36 37 38 39 FF FF FF FF FF FF    123456789......
+* Syntax: MD <addr1> <addr2>
+MEM_DMP:
+        bsr     PARAM           ; Get starting address in D1
+        tst.b   D7              ; Test for input error
+        bne     .err            ; If error then exit
+        and.b   #$F0,D1         ; Align input with 16 bytes
+        move.l  D1,A3           ; Move start to A3
+
+        bsr     PARAM           ; Get second parameter in D1
+        tst.b   D7              ; Error test again
+        beq     .sk1            ; If error on second argument just
+        move.l  A3,D1           ; print 9 lines of 16 bytes
+        add.l   #144,D1         ; by default if no second argument supplied
+.sk1    move.l  D1,A4           ; Store end address in A4
+    * Outer loop (print lines)
+.lp3    move.l  A3,D1          ; Print address in A3
+        cmp.l   #$10000,D1      ; Check size of address
+        bge     .long           ; If it is large, print a longword
+        bsr     OUT4X           ; Else print a word size
+        bra     .word           ; Skip longword
+.long   bsr     OUT8X           ; Else print a long word
+
+.word   lea     SP_4(PC),A1     ; Load space separator
+        bsr     PRINT_STR       ; and print it
+
+    * Inner loop 1 (print raw bytes)
+        move.w  #15,D6          ; Load loop counter for 16 loops
+.lp1    move.b  (A3)+,D1        ; Print byte at A3
+        bsr     OUT2X           ; and increment pointer
+        bsr     P_SPACE         ; Print spaces between bytes
+        dbra    D6,.lp1         ; loop 16 times
+
+    * Prepare for ascii section
+        lea     SP_4(PC),A1     ; Load space separator
+        bsr     PRINT_STR       ; and print it
+
+        lea     -16(A3),A3      ; Backup A3 16 bytes
+
+    * Inner loop 2 (print data as characters)
+        move.w  #15,D6          ; Load loop counter for another 16 loops
+.lp2    move.b  (A3)+,D1        ; Get byte at A3 into register, prime next byte
+        cmp.b   #$20,D1         ; If data not in printable ASCII range
+        blt     .unp            ; Use a placeholder character ('-')
+        cmp.b   #$7E,D1         ;
+        ble     .print          ; Else skip to printing D1
+.unp    move.b  #'-',D1         ; Load non-printable placeholder
+.print  bsr     PUT_CHAR        ; Print ASCII data (or non printable)
+        dbra    D6,.lp2         ; loop 16 times
+
+        bsr     NEW_LINE        ; Print newline
+
+        cmp.l   A4,A3           ; Reached end of range?
+        ble     .lp3            ; Loop until entire range printed
+        rts                     ; Else, exit if finished
+    * Error occurred
+.err    lea     ER_HEX(PC),A1   ; Load error message
+        bra     PRINT_STR       ; Print and return
+
 * -- REGISTERS -- *
+* The state of volatile registers are saved to a frame structure
+* in memory before an exception in execution.
+*   ---------------
+*   | D0-D7 (7 L) |
+*   ---------------
+*   | A0-A6 (6 L) |
+*   ---------------
+*   |  SSP (1 L)  |
+*   ---------------
+*   |  SR (1 W)   |
+*   ---------------
+*   |  PC (1 L)   |
+*   ---------------
 * Modify a register stored in the display frame.
 * Syntax: RM <reg> <value>. E.g. RM D2 1200
 REG_MOD:
@@ -570,7 +676,6 @@ REG_MOD:
 * -- DISPLAY -- *
 * Display the saved registers in the data frame
 * Saved in REG_F global table
-
 DISP:
         lea     REG_F(A6),A5        ; A5 points to display frame
         lea     DISP_MSG(PC),A1     ; Point to heading message
@@ -583,7 +688,7 @@ DISP:
         add.b   #1,D5               ; Update counter for the next pair
         move.l  (A5),D1             ; Get register data from frame
         bsr     OUT8X               ; and display it
-        lea     SPACES(PC),A1       ; Point to spaces
+        lea     SP_10(PC),A1        ; Point to spaces
         bsr     PRINT_STR           ; and print it
         move.l  32(A5),D1           ; Data address register from frame
         bsr     OUT8X               ; which is 32 byte offset from corresponding D-reg
@@ -630,18 +735,30 @@ COMTAB: DC.B    4,1
         DC.B    'HELP'
         DC.L    HELP-COMTAB
     *
+        DC.B    6,5
+        DC.B    'CLEAR '
+        DC.L    CLEAR-COMTAB
+    *
         DC.B    4,2
         DC.B    'MM  '
         DC.L    MEM_MOD-COMTAB
     *
         DC.B    4,2
+        DC.B    'MD  '
+        DC.L    MEM_DMP-COMTAB
+    *
+        DC.B    4,2
         DC.B    'RM  '
         DC.L    REG_MOD-COMTAB
     *
-        DC.B    6,2
+        DC.B    6,4
         DC.B    'DISP '
-        Dc.L    DISP-COMTAB
-    * 
+        DC.L    DISP-COMTAB
+    *
+        DC.B    4,3
+        DC.B    'JMP '
+        DC.L    JUMP-COMTAB
+    *
         DC.B    0,0         ; End of table
 
 
@@ -660,35 +777,38 @@ BANNER:
 PS1:  DC.B    '$> ',0
 
 HLP_MSG:
-        DC.B   CR,LF,'Welcome to the Komodo Monitor v0.1.0 for M68k processor'
-        DC.B   CR,LF
-        DC.B   CR,LF,'                       )/_'
-        DC.B   CR,LF,'             _.--..---',$22,'-,--c_'
-        DC.B   CR,LF,'        \L..',$27,'           ._O__)'
-        DC.B   CR,LF,',-.     _.+  _  \..--( /'
-        DC.B   CR,LF,'  `\.-',$27,$27,'__.-',$27,$27,' \ (     \_'
-        DC.B   CR,LF,'    `',$27,$27,$27,'       `\__   /\'
-        DC.B   CR,LF,'               ',$27,')'
-        DC.B   CR,LF,'COMMANDS:'
-        DC.B   CR,LF,'> DISP           - Display Registers, PC, and Status'
-        DC.B   CR,LF,'> REG  <reg>  <value>  - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
-        DC.B   CR,LF,'> MM  <address>  - Modify data in any writable location (some is protected)'
-        DC.B   CR,LF,'> MD  <address>  - Display data in any readable location'
-        DC.B   CR,LF,'> [L]OAD (string) - Load S-Record data over serial port. "string" is sent to host'
-        DC.B   CR,LF,'> [T]             - Execute program in RAM'
-        DC.B   CR,LF,'> HELP          - Display this message'
-        DC.B   CR,LF
-        DC.B   CR,LF,'Created for the final project of Microcomputer Design, 2022'
-        DC.B   CR,LF,'Author: Jackson Miller'
-        DC.B   CR,LF,'Website: www.github.com/jack-mil/mcd-asm',0
+        DC.B    CR,LF,'Welcome to the Komodo Monitor v0.1.0 for M68k processor'
+        DC.B    CR,LF
+        DC.B    CR,LF,'                       )/_'
+        DC.B    CR,LF,'             _.--..---',$22,'-,--c_'
+        DC.B    CR,LF,'        \L..',$27,'           ._O__)'
+        DC.B    CR,LF,',-.     _.+  _  \..--( /'
+        DC.B    CR,LF,'  `\.-',$27,$27,'__.-',$27,$27,' \ (     \_'
+        DC.B    CR,LF,'    `',$27,$27,$27,'       `\__   /\'
+        DC.B    CR,LF,'               ',$27,')'
+        DC.B    CR,LF,'COMMANDS:'
+        DC.B    CR,LF,'> DISP           - Display Registers, PC, and Status'
+        DC.B    CR,LF,'> REG  <reg>  <value>  - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
+        DC.B    CR,LF,'> MM   <address>  - Modify data in any writable location (some is protected)'
+        DC.B    CR,LF,'> MD   <addr1> <addr2> - Print a block of formatted data from any readable location'
+        DC.B    CR,LF,'> JMP  <address> - Begin execution at provided address'
+        DC.B    CR,LF,'> MD   <address>  - Display data in any readable location'
+        DC.B    CR,LF,'> [L]OAD (string) - Load S-Record data over serial port. "string" is sent to host'
+        DC.B    CR,LF,'> [T]             - Execute program in RAM'
+        DC.B    CR,LF,'> HELP          - Display this message'
+        DC.B    CR,LF
+        DC.B    CR,LF,'Created for the final project of Microcomputer Design, 2022'
+        DC.B    CR,LF,'Author: Jackson Miller'
+        DC.B    CR,LF,'Website: www.github.com/jack-mil/mcd-asm',0
 
 DISP_MSG:
         DC.B    CR,LF,'  Data reg         Address reg',CR,LF,0
-SPACES: DC.B    '          ',0
+SP_10: DC.B    '          ',0
 D_MSG1: DC.B    'SSP =',0
 D_MSG2: DC.B    'SR  =',0
 D_MSG3: DC.B    'PC  =',0
 
+SP_4:   DC.B    '    ',0
 ER_INV: DC.B    'Invalid command (Type [H]elp for list of commands) ',0
 ER_HEX: DC.B    CR,LF,'Invalid hex argument ',0
 ER_REG: DC.B    CR,LF,'Invalid register name ',0
