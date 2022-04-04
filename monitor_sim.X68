@@ -31,6 +31,7 @@ BUFFPT:     DS.L    1           ; Pointer to line buffer
 PARAMTR:    DS.L    1           ; Last parameter from line buffer
 ECHO:       DS.B    1           ; Enable input echo when clear
 U_CASE:     DS.B    1           ; Flag for upper-case conversion
+REG_F:      DS.W    37          ; Frame for D0-D7, A0-A6, USP, SSP, SR, PC
 
 
 * -- Simulator select bit -- *
@@ -66,7 +67,7 @@ RESET:  ORG     $008000         ; Cold entry point for monitor
         * Print welcome
 
         lea     BANNER(PC),A1   ; Point to welcome banner,
-        bsr     HEADING         ; and print it
+        bsr     PRINT_STR       ; and print it
 
 WARM:   clr.l   D7              ; Warm entry point - clear error flag
         bsr     NEW_LINE        ; Print a newline
@@ -150,7 +151,7 @@ GET_CHAR:
         movem.l  D0/A0,-(SP)     ; save D0
     IF.B SIM <EQ> #0 THEN.L
         lea     DUART,A0        ; load pointer to DUART memory
-.wait   btst    #Rx_rdy,SRA(A0) ; poll Rx status register 
+.wait   btst    #Rx_rdy,SRA(A0) ; poll Rx status register
         beq     .wait           ; wait until Rx received
         move.b  HRA(A0),D1      ; Get byte from holding into D1
     ELSE
@@ -223,7 +224,7 @@ GET_LINE:
         lea     (A1),A3         ; A3 points to start (initially)
         lea     MAXCHR(A1),A2   ; A2 points to end of buffer
     * Print prompt
-        lea     PRMPT(PC),A1    ; Load prompt string
+        lea     PS1(PC),A1    ; Load prompt string
         bsr     PRINT_STR       ; and print it
     * Loop start
 .cont   bsr     GET_CHAR        ; Receive a character in D1.
@@ -374,8 +375,8 @@ PARAM:
 *  UTILITY ROUTINES  *
 * ------------------ *
 
-* -- Hex input routines -- *
-* Read characters from serial and convert to numeric in D1
+* -- HEX INPUT -- *
+* Read characters from serial and convert to number in D1
 * Sets D7 bit 0 if hex input error occurs
 *   - HEX    =   Get 1 hex digits in D1
 *   - BYTE   =   Get 2 hex digits in D1
@@ -412,19 +413,12 @@ LONGWD:
         swap    D1              ; Move to MS position
         bra     WORD            ; Get lower word, tail return
 
-hack1   move.l  D2,-(SP)         ; Save D2 to match stack pop at end of BYTE routine
-        move.l  #hack3,-(SP)     ; Prime stack return address with middle of BYTE routine
-        
-        bra     hack2           ; Skip first GET_CHAR of HEX routine
-
-
-* Hex output routines *
-* Data to print is in D1
-* Uses tail returns (last operation branch)
-*   - OUT1X   =   Print 1 Hex character
-*   - OUT2X   =   Print 2 Hex characters
-*   - OUT4X   =   Print 2 Hex characters
-*   - OUT8X   =   Print 2 Hex characters
+* -- HEX OUTPUT -- *
+* Converts data in D1 to ascii and prints it
+*   - OUT1X  =  Print 1 Hex character
+*   - OUT2X  =  Print 2 Hex characters
+*   - OUT4X  =  Print 2 Hex characters
+*   - OUT8X  =  Print 2 Hex characters
 OUT1X:
 * Print single character (nybble)
         move.b  D1,-(SP)        ; Save D1
@@ -433,7 +427,6 @@ OUT1X:
         cmp.b   #$39,D1         ; Check if out of numeric range
         bls     .print          ; if not, print numeric char
         add.b   #$07,D1         ; Else, add extra 7 for capital A-F range
-
 .print  bsr     PUT_CHAR        ; Print the character in D1
         move.b  (SP)+,D1        ; Restore original value in D1
         rts                     ; and return
@@ -457,9 +450,8 @@ OUT8X:
         bra     OUT4X           ; Print low word, tail return
 
 MEM_DAT:
-* Print the pointer in A3 and the data pointed to by A3
-* after execution:
-*   A3 points to next word location
+* Print the pointer in A3 and the byte pointed to by A3
+* Increments A3 by 1 after execution:
         move.l  D1,-(SP)        ; Save working register
         move.l  A3,D1           ; Load A3 into input for output longword routine
         bsr     OUT8X           ; Print 8 nybbles (4 bytes, long word)
@@ -488,12 +480,12 @@ P_SPACE:
 * Prints help string and info
 HELP:
         lea     HLP_MSG(PC),A1  ; Load help message string
-        bra     PRINT_STR       ; and return
+        bra     PRINT_STR       ; and tail return
 
 * -- MEMORY -- *
 * Display data at a location specified in parameter
 * Syntax: MM <address>
-MEMORY:
+MEM_MOD:
         bsr     PARAM           ; Get start address from line buffer into D1
         tst.b   D7              ; Test for input error
         bne     .exit           ; If error then exit
@@ -511,9 +503,12 @@ MEMORY:
         bra     .loop           ; Repeat until <ESC> to exit
 .sk1    cmp.b    #CR,D1         ; Test for <CR> for next entry
         beq     .loop           ; If <CR> then display next location
-        bsr     hack1
+        move.l  #.cont,-(SP)    ; Else manipulate the stack return address to get a byte to store
+        move.l  D2,-(SP)        ; Save D2 to match stack pop at end of BYTE routine
+        move.l  #hack3,-(SP)    ; Prime stack return address with middle of BYTE routine
+        bra     hack2           ; Branch to the middle of the first HEX call in BYTE routine
     * Input Error
-        tst.b   D7              ; Test for input error
+.cont   tst.b   D7              ; Test for input error
         beq     .sk2            ; Skip error exit if valid
         lea     ER_HEX(PC),A1   ; Load error message
         bra     PRINT_STR       ; and print it (tail return)
@@ -521,6 +516,100 @@ MEMORY:
 .sk2    move.b  D1,-1(A3)       ; Store new byte
         bra     .loop           ; Repeat until <ESC>
 .exit   rts
+
+* -- REGISTERS -- *
+* Modify a register stored in the display frame.
+* Syntax: RM <reg> <value>. E.g. RM D2 1200
+REG_MOD:
+    * Parse register parameter
+        clr.l   D1              ; D1 holds the name of the register
+        lea     BUFFPT(A6),A0   ; Get address of pointer to first param in line buffer
+        move.l  (A0),A0         ; Dereference pointer. A0 contains address of first char in buffer
+
+        move.b  (A0)+,D1        ; Get first char of register name in D1
+        rol.w   #8,D1           ; Shift left
+        move.b  (A0)+,D1        ; Get second char in D1
+    * Setup next parameter
+        lea     1(A0),A0        ; Move pointer past space between params
+        move.l  A0,BUFFPT(A6)   ; Update buffer pointer
+    * Loop setup
+        clr.l   D2              ; D2 stores index of matched register
+        lea     REGS(PC),A0     ; A0 points to string of register names
+        lea     (A0),A1         ; Copy A0 to A1 as well (?)
+.loop   cmp.w   (A0)+,D1        ; Compare character pair to parameter in D1
+        beq     .found          ; If match found then exit loop
+        add.l   #1,D2           ; Else increment match counter
+        cmp.l   #19,D2          ; Test for end of loop (Register not found)
+        bne     .loop           ; Continue until all pairs searched
+    * Match error
+        lea     ER_REG(PC),A1   ; If here then input error.
+        bra     PRINT_STR       ; Display error message and tail return
+    * Calculate selected register location
+.found  lea     REG_F(A6),A1    ; A1 points to pseudo register frame
+        asl.l   #2,D2           ; Multiply register number by 4 (4 bytes/entry)
+        cmp.l   #72,D2          ; Test if PC was selected (last entry)
+        bne     .calc           ; If not PC then finished
+        sub.l   #2,D2           ; Else decrement by 2 because SR is a word (2 bytes)
+.calc   lea     (A1,D2),A2      ; Calculate address of entry in display table
+        move.l  (A2),D1         ; Get old contents
+        bsr     OUT8X           ; and display them
+        bsr     NEW_LINE
+        bsr     PARAM           ; Get new value
+        tst.b   D7              ; Test for input error
+        beq     .store          ; If no error then goto store data
+        lea     ER_HEX(PC),A1   ; Else, load error message
+        bra     PRINT_STR       ; Display and tail return
+    * Store 'register' value in frame
+.store  cmp.l   #68,D2          ; If the Status Register was selected then
+        beq     .word           ; only a word to store
+        move.l  D1,(A2)         ; Else store new data in memory frame
+        rts
+.word   move.w  D1,(A2)         ; Store one word SR
+        rts
+
+* -- DISPLAY -- *
+* Display the saved registers in the data frame
+* Saved in REG_F global table
+
+DISP:
+        lea     REG_F(A6),A5        ; A5 points to display frame
+        lea     DISP_MSG(PC),A1     ; Point to heading message
+        bsr     PRINT_STR           ; and print it
+        move.w  #7,D6               ; 8 pairs of registers to display
+        clr.b   D5                  ; D5 is the line counter
+.loop   move.b  D5,D1               ; Put current register number in D0
+        bsr     OUT1X               ; and print it
+        bsr     P_SPACE             ; and a space
+        add.b   #1,D5               ; Update counter for the next pair
+        move.l  (A5),D1             ; Get register data from frame
+        bsr     OUT8X               ; and display it
+        lea     SPACES(PC),A1       ; Point to spaces
+        bsr     PRINT_STR           ; and print it
+        move.l  32(A5),D1           ; Data address register from frame
+        bsr     OUT8X               ; which is 32 byte offset from corresponding D-reg
+        bsr     NEW_LINE            ;
+        lea     4(A5),A5            ; Increment pointer to next register
+        dbra    D6,.loop            ; Repeat until all 8 pairs displayed
+    *
+        lea     32(A5),A5           ; Adjust pointer by 8 longwords
+        bsr     NEW_LINE            ; to point to SSP
+        lea     D_MSG1(PC),A1       ; Point to "SSP ="
+        bsr     PRINT_STR           ; Print it
+        move.l  (A5)+,D1            ; Get System Stack Pointer
+        jsr     OUT8X               ; and print it
+        bsr     NEW_LINE
+    *
+        lea     D_MSG2(PC),A1       ; Point to "SR ="
+        bsr     PRINT_STR           ; Print it
+        move.w  (A5)+,D1            ; Get status register
+        bsr     OUT4X               ; Print it
+        bsr     NEW_LINE
+    *
+        lea     D_MSG3(PC),A1       ; Point to "PC ="
+        bsr     PRINT_STR           ; Print it
+        move.l  (A5)+,D1            ; Get Program counter
+        bsr     OUT8X               ; Print it
+        bra     NEW_LINE            ; Newline and tail return
 
 
 
@@ -543,36 +632,32 @@ COMTAB: DC.B    4,1
     *
         DC.B    4,2
         DC.B    'MM  '
-        DC.L    MEMORY-COMTAB
+        DC.L    MEM_MOD-COMTAB
     *
+        DC.B    4,2
+        DC.B    'RM  '
+        DC.L    REG_MOD-COMTAB
+    *
+        DC.B    6,2
+        DC.B    'DISP '
+        Dc.L    DISP-COMTAB
+    * 
         DC.B    0,0         ; End of table
 
 
-
-
-
-
 * ---------------------- *
-*         STRINGS        *
+*       STRING DATA      *
 * ---------------------- *
 CRLF:   DC.B    CR,LF,0
 BANNER:
-        DC.B                  '                    | |/ /___  _ __ ___   ___   __| | ___'
+        DC.B            CR,LF,'                    | |/ /___  _ __ ___   ___   __| | ___'
         DC.B            CR,LF,'                    | ',$27,' // _ \| ',$27,'_ ` _ \ / _ \ / _` |/ _ \'
         DC.B            CR,LF,'                    | . \ (_) | | | | | | (_) | (_| | (_) |'
         DC.B            CR,LF,'                    |_|\_\___/|_| |_| |_|\___/ \__,_|\___/'
         DC.B            CR,LF,CR,LF,'                            Komodo Monitor v0.1.0'
         DC.B            CR,LF,'(Type HELP for help)',CR,LF,0
 
-PRMPT:   DC.B    CR,LF,'$> ',0
-
-;                        )/_
-;              _.--..---"-,--c_
-;         \L..'           ._O__)_
-; ,-.     _.+  _  \..--( /           a:f
-;   `\.-''__.-' \ (     \_      
-;     `'''       `\__   /\
-;                 ')
+PS1:  DC.B    '$> ',0
 
 HLP_MSG:
         DC.B   CR,LF,'Welcome to the Komodo Monitor v0.1.0 for M68k processor'
@@ -585,29 +670,32 @@ HLP_MSG:
         DC.B   CR,LF,'    `',$27,$27,$27,'       `\__   /\'
         DC.B   CR,LF,'               ',$27,')'
         DC.B   CR,LF,'COMMANDS:'
-        DC.B   CR,LF,'> [RM]  <reg>  - Display or modify any D0-D7, A0-A6 register'
-        DC.B   CR,LF,'> [MD]  <address>  - Display data in any readable location'
-        DC.B   CR,LF,'> [MM]  <address>  - Modify data in any writable location (some is protected)'
+        DC.B   CR,LF,'> DISP           - Display Registers, PC, and Status'
+        DC.B   CR,LF,'> REG  <reg>  <value>  - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
+        DC.B   CR,LF,'> MM  <address>  - Modify data in any writable location (some is protected)'
+        DC.B   CR,LF,'> MD  <address>  - Display data in any readable location'
         DC.B   CR,LF,'> [L]OAD (string) - Load S-Record data over serial port. "string" is sent to host'
         DC.B   CR,LF,'> [T]             - Execute program in RAM'
-        DC.B   CR,LF,'> [H]ELP          - Display this message'
+        DC.B   CR,LF,'> HELP          - Display this message'
         DC.B   CR,LF
         DC.B   CR,LF,'Created for the final project of Microcomputer Design, 2022'
         DC.B   CR,LF,'Author: Jackson Miller'
         DC.B   CR,LF,'Website: www.github.com/jack-mil/mcd-asm',0
 
+DISP_MSG:
+        DC.B    CR,LF,'  Data reg         Address reg',CR,LF,0
+SPACES: DC.B    '          ',0
+D_MSG1: DC.B    'SSP =',0
+D_MSG2: DC.B    'SR  =',0
+D_MSG3: DC.B    'PC  =',0
+
 ER_INV: DC.B    'Invalid command (Type [H]elp for list of commands) ',0
-ER_HEX: DC.B    CR,LF,'Invalid hex input ',0
+ER_HEX: DC.B    CR,LF,'Invalid hex argument ',0
+ER_REG: DC.B    CR,LF,'Invalid register name ',0
 
 * Register name pairs are used for matching parameters for RM command
 REGS:   DC.B    'D0D1D2D3D4D5D6D7'
         DC.B    'A0A1A2A3A4A5A6A7'
-        DC.B    'SSSR'
-        DC.B    'PC  ',0
+        DC.B    'SSSRPC  ',0
 * ---------------------- *
     END RESET
-
-*~Font name~Courier New~
-*~Font size~10~
-*~Tab type~1~
-*~Tab size~4~
