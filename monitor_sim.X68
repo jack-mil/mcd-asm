@@ -348,9 +348,7 @@ PARAM:
 
 .loop   move.b  (A0)+,D1        ; Get character from line buffer
         cmp.b   #SPACE,D1       ; Test for delimiter
-        beq     .exit
-        cmp.b   #CR,D1          ; Either space or carriage return
-        beq     .exit           ; Exit if either found
+        beq     .exit           ; and exit
 
         asl.l   #4,D2           ; Shift accumulated result 4 bits left
         sub.b   #$30,D1         ; Convert ASCII char to hex
@@ -362,7 +360,9 @@ PARAM:
         bgt     .error          ; then exit to non-hex error
 
 .cont   add.b   D1,D2           ; Add latest nybble to total in D2
-        bra     .loop           ; Repeat until delimiter found
+        cmp.b   #CR,(A0)        ; See if next char is carriage return
+        beq     .exit           ; Exit if so
+        bra     .loop           ; Otherwise repeat until delimiter found
 .exit   move.l  A0,BUFFPT(A6)   ; Save pointer (to next parameter) in memory
         move.l  D2,PARAMTR(A6)  ; Save parameter in memory
         move.l  D2,D1           ; Put parameter in D1 for return
@@ -443,35 +443,18 @@ OUT4X:
         bsr     OUT2X           ; Print MS byte first
         rol.w   #8,D1           ; Restore LS byte
         bra     OUT2X           ; Print LS byte last, tail return
+OUT6X:
+* Print a representation of an address (24 bits, 6 bytes)
+        swap    D1              ; Swap high and low words
+        bsr     OUT2X           ; Print most significant byte
+        swap    D1              ; Swap back to original
+        bra     OUT4X           ; Print low word
 OUT8X:
 * Print a longword (4 bytes)
         swap    D1              ; Swap high and low words
         bsr     OUT4X           ; Print high word
         swap    D1              ; Swap back to original
         bra     OUT4X           ; Print low word, tail return
-
-MEM_DAT:
-* Print the pointer in A3 and the byte pointed to by A3
-* Increments A3 by 1 after execution:
-        move.l  D1,-(SP)        ; Save working register
-        move.l  A3,D1           ; Load A3 into input for output longword routine
-        bsr     OUT8X           ; Print 8 nybbles (4 bytes, long word)
-        bsr     P_SPACE         ; Print single space
-        move.b  (A3)+,D1        ; Move byte data at this address into D1
-        bsr     OUT2X           ; and display it
-        move.l  (SP)+,D1        ; Restore state
-        rts                     ; and return
-
-P_ADDR:
-* Print the nicely formatted address in A3
-* Does not modify A3
-        move.l  A3,D1       ; Copy A3 into register for printing
-    IF.L D1 <LT> #$10000 THEN
-        bsr     OUT4X
-    ELSE
-        bsr     OUT8X
-    ENDI
-        rts
 
 P_SPACE:
 * Prints a single space
@@ -481,6 +464,8 @@ P_SPACE:
         bsr     PUT_CHAR        ; character
         move.b  (SP)+,D1        ; Restore state
         rts                     ; and return
+
+CHECK
 
 
 * ---------------------- *
@@ -503,12 +488,12 @@ CLEAR:
 JUMP:
         bsr     PARAM           ; Get address from command buffer
         tst.b   D7              ; Test for error bit set
-        bne     .exit           ; If error flag not 0, exit with error
+        bne     .err            ; If error flag not 0, exit with error
         tst.l   D1              ; Else test for missing argument
-        beq     .exit           ; If no address provided, exit with error
+        beq     .err            ; If no address provided, exit with error
         move.l  D1,A0           ; Otherwise load A0 with address
         jmp     (A0)            ; and call the subroutine. USER to provide RTS!!
-.exit   lea     ER_HEX(PC),A1   ; If error,load error message,
+.err    lea     ER_HEX(PC),A1   ; If error,load error message,
         bra     PRINT_STR       ; print and tail return
 
 
@@ -518,10 +503,14 @@ JUMP:
 MEM_MOD:
         bsr     PARAM           ; Get start address from line buffer into D1
         tst.b   D7              ; Test for input error
-        bne     .exit           ; If error then exit
+        bne     .er1            ; If error then exit
+    * Setup
+        lea     MM_MSG(PC),A1   ; Load usage message
+        jsr     PRINT_STR       ; and print it
         move.l  D1,A3           ; Load A3 with pointer to memory from parameter
+    * Repeat until user enters [ESC]
 .loop   bsr     NEW_LINE        ; Print newline
-        bsr     MEM_DAT         ; Print current address and contents
+        bsr     OUT_MEM         ; Print current address and contents (increments A3)
         bsr     P_SPACE         ; and a space
         bsr     GET_CHAR        ; then wait for user input
         cmp.b   #ESC,D1         ; If input is <ESC>
@@ -533,48 +522,68 @@ MEM_MOD:
         bra     .loop           ; Repeat until <ESC> to exit
 .sk1    cmp.b    #CR,D1         ; Test for <CR> for next entry
         beq     .loop           ; If <CR> then display next location
+
+    * Hack to intercept GET_BYTE routine to include nibble already in D1
         move.l  #.cont,-(SP)    ; Else manipulate the stack return address to get a byte to store
         move.l  D2,-(SP)        ; Save D2 to match stack pop at end of BYTE routine
         move.l  #hack3,-(SP)    ; Prime stack return address with middle of BYTE routine
         bra     hack2           ; Branch to the middle of the first HEX call in BYTE routine
-    * Input Error
+    * Test for input error
 .cont   tst.b   D7              ; Test for input error
-        beq     .sk2            ; Skip error exit if valid
-        lea     ER_HEX(PC),A1   ; Load error message
-        bra     PRINT_STR       ; and print it (tail return)
-
-.sk2    move.b  D1,-1(A3)       ; Store new byte
+        bne     .er2            ; Goto error exit if invalid input
+        ; lea     ER_HEX(PC),A1 ; Load error message
+        ; bra     PRINT_STR     ; and print it (tail return)
+        move.b  D1,-1(A3)       ; Store new byte (A3 was post incremented)
         bra     .loop           ; Repeat until <ESC>
 .exit   rts
+.er1    lea     MM_ERR(PC),A1
+        bra     PRINT_STR
+.er2    lea     ER_HEX(PC),A1   ; Print error messages here
+        bra     PRINT_STR
+
+OUT_MEM:
+* Print the pointer in A3 and the byte pointed to by A3
+* Increments A3 by 1 after execution:
+        move.l  D1,-(SP)        ; Save working register
+        move.l  A3,D1           ; Load A3 into input for output address routine
+        bsr     OUT6X           ; Print 8 nybbles (4 bytes, long word)
+        bsr     P_SPACE         ; Print single space
+        move.b  (A3)+,D1        ; Move byte data at this address into D1
+        bsr     OUT2X           ; and display it
+        move.l  (SP)+,D1        ; Restore state
+        rts                     ; and return
+
 
 * -- MEMORY DUMP -- *
 * Hex Dump a block of data in memory
 * Each line has 16 bytes and the corresponding ascii characters
 * Starting address is aligned to 16 bytes
 * C020    31 32 33 34 35 36 37 38 39 FF FF FF FF FF FF    123456789......
-* Syntax: MD <addr1> <addr2>
+* Syntax: MD <addr1> [addr2]
+* If addr2 omitted, print 9 lines from starting point
 MEM_DMP:
         bsr     PARAM           ; Get starting address in D1
         tst.b   D7              ; Test for input error
-        bne     .err            ; If error then exit
-        and.b   #$F0,D1         ; Align input with 16 bytes
+        bne     .er1            ; If error then exit
+        and.l   #$FFFFF0,D1     ; Truncate input to 6 bytes and align to 16 bytes
+        cmp.l   #DUART,D1       ; Ensure only memory from Ram/Rom can be displayed
+        bge     .er2            ; Reading randomly from the DUART space can cause issues
         move.l  D1,A3           ; Move start to A3
-
+* Optional second parameter
         bsr     PARAM           ; Get second parameter in D1
         tst.b   D7              ; Error test again
         beq     .sk1            ; If error on second argument just
         move.l  A3,D1           ; print 9 lines of 16 bytes
-        add.l   #144,D1         ; by default if no second argument supplied
+        add.l   #$90,D1         ; by default if no second argument supplied
 .sk1    move.l  D1,A4           ; Store end address in A4
+* Print heading
+        lea     MD_MSG(PC),A1
+        bsr     PRINT_STR
     * Outer loop (print lines)
-.lp3    move.l  A3,D1          ; Print address in A3
-        cmp.l   #$10000,D1      ; Check size of address
-        bge     .long           ; If it is large, print a longword
-        bsr     OUT4X           ; Else print a word size
-        bra     .word           ; Skip longword
-.long   bsr     OUT8X           ; Else print a long word
+.lp3    move.l  A3,D1           ; Load starting address into A3
+        bsr     OUT6X           ; and print the 6 byte address
 
-.word   lea     SP_4(PC),A1     ; Load space separator
+.word   lea     DIV_1(PC),A1    ; Load space separator,
         bsr     PRINT_STR       ; and print it
 
     * Inner loop 1 (print raw bytes)
@@ -585,8 +594,8 @@ MEM_DMP:
         dbra    D6,.lp1         ; loop 16 times
 
     * Prepare for ascii section
-        lea     SP_4(PC),A1     ; Load space separator
-        bsr     PRINT_STR       ; and print it
+        lea     DIV_2(PC),A1     ; Load space separator
+        bsr     PRINT_STR        ; and print it
 
         lea     -16(A3),A3      ; Backup A3 16 bytes
 
@@ -607,8 +616,20 @@ MEM_DMP:
         ble     .lp3            ; Loop until entire range printed
         rts                     ; Else, exit if finished
     * Error occurred
-.err    lea     ER_HEX(PC),A1   ; Load error message
+.er1    lea     ER_HEX(PC),A1   ; Load error message
         bra     PRINT_STR       ; Print and return
+.er2    lea     ER_MEM(PC),A1
+        bra     PRINT_STR
+
+; IS_ASCII:
+; * Check if byte in D1 is in ascii range
+;         cmp.b   #20,D1
+;         blt     .unp
+;         cmp.b   #$7E,D1
+;         ble     .print
+; .unp    or.b    #2,D7
+; .print  rts
+
 
 * -- REGISTERS -- *
 * The state of volatile registers are saved to a frame structure
@@ -632,16 +653,16 @@ REG_MOD:
         lea     BUFFPT(A6),A0   ; Get address of pointer to first param in line buffer
         move.l  (A0),A0         ; Dereference pointer. A0 contains address of first char in buffer
 
-        move.b  (A0)+,D1        ; Get first char of register name in D1
-        rol.w   #8,D1           ; Shift left
-        move.b  (A0)+,D1        ; Get second char in D1
+        move.b  (A0)+,D1        ; Get one byte at time in case of odd address
+        rol.w   #8,D1           ; Shift first character of param left
+        move.b  (A0)+,D1        ; Get second char in D1 LSB position
     * Setup next parameter
         lea     1(A0),A0        ; Move pointer past space between params
         move.l  A0,BUFFPT(A6)   ; Update buffer pointer
     * Loop setup
         clr.l   D2              ; D2 stores index of matched register
         lea     REGS(PC),A0     ; A0 points to string of register names
-        lea     (A0),A1         ; Copy A0 to A1 as well (?)
+        ; lea     (A0),A1         ; Copy A0 to A1 as well (?)
 .loop   cmp.w   (A0)+,D1        ; Compare character pair to parameter in D1
         beq     .found          ; If match found then exit loop
         add.l   #1,D2           ; Else increment match counter
@@ -787,14 +808,14 @@ HLP_MSG:
         DC.B    CR,LF,'    `',$27,$27,$27,'       `\__   /\'
         DC.B    CR,LF,'               ',$27,')'
         DC.B    CR,LF,'COMMANDS:'
-        DC.B    CR,LF,'> DISP           - Display Registers, PC, and Status'
-        DC.B    CR,LF,'> REG  <reg>  <value>  - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
+        DC.B    CR,LF,'> DISP                 - Display Registers, PC, and Status'
+        DC.B    CR,LF,'> RM   <reg>  <value>  - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
         DC.B    CR,LF,'> MM   <address>  - Modify data in any writable location (some is protected)'
-        DC.B    CR,LF,'> MD   <addr1> <addr2> - Print a block of formatted data from any readable location'
+        DC.B    CR,LF,'> MD   <addr1> [addr2] - Print a block of formatted data from any readable location'
         DC.B    CR,LF,'> JMP  <address> - Begin execution at provided address'
-        DC.B    CR,LF,'> MD   <address>  - Display data in any readable location'
-        DC.B    CR,LF,'> [L]OAD (string) - Load S-Record data over serial port. "string" is sent to host'
-        DC.B    CR,LF,'> [T]             - Execute program in RAM'
+        ; DC.B    CR,LF,'> [L]OAD (string) - Load S-Record data over serial port. "string" is sent to host'
+        ; DC.B    CR,LF,'> [T]             - Execute program in RAM'
+        DC.B    CR,LF,'> CLEAR         - Clear the screen'
         DC.B    CR,LF,'> HELP          - Display this message'
         DC.B    CR,LF
         DC.B    CR,LF,'Created for the final project of Microcomputer Design, 2022'
@@ -803,17 +824,24 @@ HLP_MSG:
 
 DISP_MSG:
         DC.B    CR,LF,'  Data reg         Address reg',CR,LF,0
-SP_10: DC.B    '          ',0
+SP_10:  DC.B    '          ',0
 D_MSG1: DC.B    'SSP =',0
 D_MSG2: DC.B    'SR  =',0
 D_MSG3: DC.B    'PC  =',0
 
-SP_4:   DC.B    '    ',0
-ER_INV: DC.B    'Invalid command (Type [H]elp for list of commands) ',0
-ER_HEX: DC.B    CR,LF,'Invalid hex argument ',0
-ER_REG: DC.B    CR,LF,'Invalid register name ',0
+MM_ERR: DC.B    CR,LF,'Syntax: MM <addr>. Must be within RAM 010000 - 01FFFF',CR,LF,0
+MM_MSG: DC.B    '[BACKSP] previous byte | [ENTER] next byte | [ESC] to exit',0
+
+MD_MSG: DC.B    CR,LF,'Address:   00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F     0123456789ABCDEF',CR,LF,0
+DIV_1:  DC.B    '  |  ',0
+DIV_2:  DC.B    ' |  ',0
+ER_INV: DC.B    CR,LF,'Invalid command (Type [H]elp for list of commands) ',CR,LF,0
+ER_HEX: DC.B    CR,LF,'Invalid hex argument ',CR,LF,0
+ER_REG: DC.B    CR,LF,'Invalid register name ',CR,LF,0
+ER_MEM: DC.B    CR,LF,'Invalid memory access ',CR,LF,0
 
 * Register name pairs are used for matching parameters for RM command
+        DS.W    0       ; Force even word alignment here
 REGS:   DC.B    'D0D1D2D3D4D5D6D7'
         DC.B    'A0A1A2A3A4A5A6A7'
         DC.B    'SSSRPC  ',0
