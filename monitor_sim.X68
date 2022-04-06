@@ -1,20 +1,8 @@
 * ------------------- *
 * M68k system monitor
-* Jackson Miller
+* jackmil
 * MCD 2022
 * ------------------- *
-
-* -- Symbol equates -- *
-BS:         EQU     $08     ; Backspace
-CR:         EQU     $0D     ; Carriage Return
-LF:         EQU     $0A     ; Line Feed
-ESC:        EQU     $1B     ; Escape
-SPACE:      EQU     $20     ; Space
-NUL:        EQU     $00     ; Null
-CTRL_A:     EQU     $01     ; Quits line editing
-CTRL_C:     EQU     $03     ; Quits line editing
-CTRL_L:     EQU     $0C     ; Clear console
-EOT:        EQU     $04     ; End-of-Transmission ctrl^d
 
 * -- Device addresses -- *
 ROM:        EQU     $000000     ; ROM Start
@@ -22,9 +10,9 @@ RAM:        EQU     $010000     ; RAM Start
 DUART:      EQU     $020000     ; DUART base address
 
 STACK:      EQU     $020000     ; Location of stack (grows up from bottom of RAM)
-MAXCHR:     EQU     64          ; Length (bytes) of input line buffer
 
 * Data and global variable definition
+MAXCHR:     EQU     64          ; Length (bytes) of input line buffer
 DATA:       EQU     RAM         ; Data origin
 LNBUFF:     DS.B    MAXCHR      ; Input line buffer
 BUFFEND:    EQU     LNBUFF+MAXCHR-1 ; end of line buffer
@@ -465,7 +453,15 @@ P_SPACE:
         move.b  (SP)+,D1        ; Restore state
         rts                     ; and return
 
-CHECK
+DELAY:
+* Provides a small delay. Used in srec loading for host
+* to process input
+        move.l  D0,-(SP)        ;
+        move.l  #$4000,D0       ;
+.wait   sub.l   #1,D0
+        bne     .wait
+        move.l  (SP)+,D0
+        rts
 
 
 * ---------------------- *
@@ -513,8 +509,10 @@ MEM_MOD:
         bsr     OUT_MEM         ; Print current address and contents (increments A3)
         bsr     P_SPACE         ; and a space
         bsr     GET_CHAR        ; then wait for user input
-        cmp.b   #ESC,D1         ; If input is <ESC>
+        cmp.b   #ESC,D1         ; If input is <ESC> or Ctrl-C
         beq     .exit           ; exit
+        cmp.b   #CTRL_C,D1
+        beq     .exit
         cmp.b   #BS,D1          ; If input is <BACK> (CTRL^H) character, go backwards
         bne     .sk1            ; Else skip backstep procedure
     * Backstep
@@ -738,6 +736,91 @@ DISP:
         bra     NEW_LINE            ; Newline and tail return
 
 
+* --------------- *
+*    LOAD SREC    *
+* --------------- *
+* Load an assembled s-record formatted program into RAM storage
+* While executing: D3 - Checksum accumulator, D2 - Byte count to read
+*                  D1 - Current byte read,    A2 - Destination address
+LOAD:
+        ; add.b   #1,ECHO(A6)         ; Disable auto echo
+        bsr     NEW_LINE            ;
+        ; bsr     DELAY               ; Wait for host to settle (?)
+        ; bsr     DELAY               ;
+    * Transmit string argument (srecord file name to load)
+        move.l  BUFFPT(A6),A4       ;
+.arg    move.b  (A4)+,D1            ; Read from buffer
+        bsr     PUT_CHAR            ; and output characters
+        cmp.b   #CR,D1              ; until End of Line
+        bne     .arg
+        bsr     NEW_LINE            ; Send an extra newline to indicate ready for transmision
+    * Check for end
+.next   bsr     GET_CHAR            ; Each line of records must start
+        cmp.b   #CTRL_C,D1          ; Exit load loop
+        beq     .exit               ; when CTRL-C received
+        cmp.b   #'S',D1             ; Else, check for start of record
+        bne     .next               ; Must start with S1/S2 (data) or S9/S8 (termination)
+        bsr     GET_CHAR            ; Get character after the 'S'
+        cmp.b   #'9',D1             ; Test for S9 or S8 terminators
+        beq     .exit               ; If S9 type then check for errors and exit
+        cmp.b   #'8',D1             ; else test for S8 type, fall through to exit
+        bne     .data               ; else goto process data type record
+    * Load exit point
+.exit   clr.b   ECHO(A6)            ; Enable automatic echo
+        btst    #0,D7               ; Test for input error
+        beq     .chk                ; If no input error, check checksum error
+        lea     ER_HEX(PC),A1       ; Else, Load and print error message
+        bsr     PRINT_STR           ; continue to also handle checksum error
+.chk    btst    #2,D7               ; Test for checksum error
+        beq     .rts                ; If clear then exit
+        lea     ER_LOD(PC),A1       ; If error, then load error message
+        bsr     PRINT_STR           ; and Print it
+.rts    rts                         ; Return from LOAD
+    * Check data record type (S1/S2)
+.data   cmp.b   #'1',D1             ; Test for S1 type record
+        beq     .s1                 ; If S1 then read it
+        cmp.b   #'2',D1             ; Else test for S2 record
+        bne     .next               ; If unsupported type, skip to next one
+    * Process 3-byte addr for S2 type record
+        clr.b   D3                  ; Else S2 type. Clear initial checksum
+        bsr     .read1              ; Get the record length in D1
+        sub.b   #4,D1               ; Subtract 4 from record length (3 byte address, 1 chksum)
+        move.b  D1,D2               ; D2 holds byte count to be read
+        clr.l   D1                  ; Clear D1 to accumulate address
+        bsr     .read1              ; Read most significant byte of address
+        asl.l   #8,D1               ; Shift one byte left
+        bsr     .read1              ; Read middle byte of address
+        asl.l   #8,D1               ; Shift both one byte left
+        bsr     .read1              ; Read last byte of address
+        move.l  D1,A2               ; A2 points to destination of data
+        bra     .store              ; Skip S1 processing section
+    * Process 2-byte addr for S1 type record
+.s1     clr.b   D3                  ; S1 record found. Clear checksum
+        bsr     .read1              ; Get length byte and update checksum
+        sub.b   #3,D1               ; Subtract 3 from record length (2 byte address, 1 chksum)
+        move.b  D1,D2               ; D2 holds byte count to be read
+        clr.l   D1                  ; Clear D1 to accumulate address
+        bsr     .read1              ; Get MS byte of destination address
+        asl.l   #8,D1               ; Shift MS byte in position
+        bsr     .read1              ; Get LS byte in D2
+        move.l  D1,A2               ; A2 points to destination of data
+    * Read n bytes and store starting at addr in A3
+.store  bsr     .read1              ; Read byte of data from record
+        move.b  D1,(A2)+            ; Store it
+        sub.b   #1,D2               ; Decrement byte counter
+        bne     .store              ; Loop until all bytes read
+    * Final checksum calculation
+    * Byte sum of length + address + data + checksum + 1 should = 0
+        bsr     .read1              ; Read checksum (final byte)
+        add.b   #1,D3               ; Add 1 to calculated sum
+        beq     .next               ; If zero (chk passed) then start next record
+        or.b    #%0000100,D7        ; Else set checksum error bit flag
+        bra     .exit               ; and cleanup and exit LOAD
+
+    * Utility to get a byte from the srec and update running sum
+.read1  bsr     BYTE                ; Get a byte in D1
+        add.b   D1,D3               ; Update checksum
+        rts
 
 * ------------------- *
 *    COMMAND TABLE    *
@@ -776,6 +859,10 @@ COMTAB: DC.B    4,1
         DC.B    'DISP '
         DC.L    DISP-COMTAB
     *
+        DC.B    6,4
+        DC.B    'LOAD  '
+        DC.L    LOAD-COMTAB
+    *
         DC.B    4,3
         DC.B    'JMP '
         DC.L    JUMP-COMTAB
@@ -786,6 +873,21 @@ COMTAB: DC.B    4,1
 * ---------------------- *
 *       STRING DATA      *
 * ---------------------- *
+
+* -- Symbol equates -- *
+BS:         EQU     $08     ; Backspace
+CR:         EQU     $0D     ; Carriage Return
+LF:         EQU     $0A     ; Line Feed
+ESC:        EQU     $1B     ; Escape
+SPACE:      EQU     $20     ; Space
+NUL:        EQU     $00     ; Null
+CTRL_A:     EQU     $01     ; Quits line editing
+CTRL_C:     EQU     $03     ; Quits line editing
+CTRL_L:     EQU     $0C     ; Clear console
+EOT:        EQU     $04     ; End-of-Transmission ctrl^d
+
+* Null terminated strings *
+
 CRLF:   DC.B    CR,LF,0
 BANNER:
         DC.B            CR,LF,'                    | |/ /___  _ __ ___   ___   __| | ___'
@@ -812,8 +914,8 @@ HLP_MSG:
         DC.B    CR,LF,'> RM   <reg>  <value>  - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
         DC.B    CR,LF,'> MM   <address>  - Modify data in any writable location (some is protected)'
         DC.B    CR,LF,'> MD   <addr1> [addr2] - Print a block of formatted data from any readable location'
+        DC.B    CR,LF,'> LOAD (string) - Load S-Record data over serial port. "string" is sent to host'
         DC.B    CR,LF,'> JMP  <address> - Begin execution at provided address'
-        ; DC.B    CR,LF,'> [L]OAD (string) - Load S-Record data over serial port. "string" is sent to host'
         ; DC.B    CR,LF,'> [T]             - Execute program in RAM'
         DC.B    CR,LF,'> CLEAR         - Clear the screen'
         DC.B    CR,LF,'> HELP          - Display this message'
@@ -835,10 +937,12 @@ MM_MSG: DC.B    '[BACKSP] previous byte | [ENTER] next byte | [ESC] to exit',0
 MD_MSG: DC.B    CR,LF,'Address:   00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F     0123456789ABCDEF',CR,LF,0
 DIV_1:  DC.B    '  |  ',0
 DIV_2:  DC.B    ' |  ',0
-ER_INV: DC.B    CR,LF,'Invalid command (Type [H]elp for list of commands) ',CR,LF,0
-ER_HEX: DC.B    CR,LF,'Invalid hex argument ',CR,LF,0
-ER_REG: DC.B    CR,LF,'Invalid register name ',CR,LF,0
-ER_MEM: DC.B    CR,LF,'Invalid memory access ',CR,LF,0
+
+ER_INV: DC.B    CR,LF,'Invalid command (Type [H]elp for list of commands)',CR,LF,0
+ER_HEX: DC.B    CR,LF,'Invalid hex input',CR,LF,0
+ER_REG: DC.B    CR,LF,'Invalid register name',CR,LF,0
+ER_MEM: DC.B    CR,LF,'Invalid memory access',CR,LF,0
+ER_LOD: DC.B    CR,LF,'Load error (Checksum invalid) ',CR,LF,0
 
 * Register name pairs are used for matching parameters for RM command
         DS.W    0       ; Force even word alignment here
@@ -847,3 +951,4 @@ REGS:   DC.B    'D0D1D2D3D4D5D6D7'
         DC.B    'SSSRPC  ',0
 * ---------------------- *
     END RESET
+
