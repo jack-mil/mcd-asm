@@ -11,9 +11,9 @@ DUART:      EQU     $020000     ; DUART base address
 
 STACK:      EQU     $020000     ; Location of stack (grows up from bottom of RAM)
 
-* Data and global variable definition
-MAXCHR:     EQU     64          ; Length (bytes) of input line buffer
+* Data and global variable offset definitions
 DATA:       EQU     RAM         ; Data origin
+MAXCHR:     EQU     64          ; Length (bytes) of input line buffer
 LNBUFF:     DS.B    MAXCHR      ; Input line buffer
 BUFFEND:    EQU     LNBUFF+MAXCHR-1 ; end of line buffer
 BUFFPT:     DS.L    1           ; Pointer to line buffer
@@ -25,17 +25,25 @@ REG_F:      DS.W    37          ; Frame for D0-D7, A0-A6, USP, SSP, SR, PC
 
 * -- Simulator select bit -- *
 sim:        EQU     $1          ; 1 -> simulator / 0 -> hardware
-            OPT     SEX
+            OPT     SEX         ; Expand assembler syntax
 
 * ---------------------- *
 *       RESET START      *
 * ---------------------- *
-        ORG     $000000
+        ORG     $000
         DC.L    STACK       ; Supervisor stack pointer on reset
         DC.L    RESET       ; Reset address vector
+        ; DC.L    BUS_EX      ; Bus error vector
+        ; DC.L    ADD_EX      ; Address error vector
+        ORG     $080
+        DC.L    TRAP_0
+        ORG     $0BC
+        DC.L    TRAP_15
 
 RESET:  ORG     $008000         ; Cold entry point for monitor
-        IFNE sim                ; Disable keyboard echo on simulator
+
+    * Compiled on simulator only
+    IFNE sim                ; Disable keyboard echo on simulator
         move.b  #$00,D1
         move.b  #12,D0
         trap    #15
@@ -45,8 +53,16 @@ RESET:  ORG     $008000         ; Cold entry point for monitor
         trap    #15
 
         move.l  #STACK,A7       ; Manually SSP because simulator weird?
-        ENDC
+
+        clr.l   D0              ; Reset used registers
+        clr.l   D1
+    ENDC
+
+    * Main setup begins
         jsr     INIT_SERIAL     ; Initilize duart device
+
+        trap    #0              ; Trap 0 saves a snapshot of register state
+                                ; Display with DISP command
 
         * Setup global vars
         lea     DATA,A6         ; A6 points to data area
@@ -59,6 +75,7 @@ RESET:  ORG     $008000         ; Cold entry point for monitor
         bsr     PRINT_STR       ; and print it
 
 WARM:   clr.l   D7              ; Warm entry point - clear error flag
+        lea     DATA,A6         ; Restore pointer to data area used in subroutines
         bsr     NEW_LINE        ; Print a newline
         bsr     GET_LINE        ; Get command line
         bsr     CLEAN_UP        ; Clean up readline buffer contents
@@ -137,7 +154,8 @@ PUT_CHAR:
 * after execution:
 *   D1 - Byte received
 GET_CHAR:
-        movem.l  D0/A0,-(SP)     ; save D0
+        movem.l  D0/A0/A6,-(SP)     ; save D0
+        lea     DATA,A6         ; Pointer to data area
     IF.B SIM <EQ> #0 THEN.L
         lea     DUART,A0        ; load pointer to DUART memory
 .wait   btst    #Rx_rdy,SRA(A0) ; poll Rx status register
@@ -159,7 +177,7 @@ GET_CHAR:
 .echo   tst.b   ECHO(A6)        ; Test is echo input set
         bne.s   .exit           ; If ECHO global var not clear then no echo
         bsr     PUT_CHAR        ; Else software echo the input (look into loopback later)
-.exit   movem.l  (SP)+,D0/A0    ; Restore state
+.exit   movem.l  (SP)+,D0/A0/A6    ; Restore state
         rts                     ; and return
 
 
@@ -236,7 +254,7 @@ GET_LINE:
 .chk    cmp.l   A2,A3           ; Test for buffer overflow
         bne     .cont           ; If buffer not full then continue
     * Loop end
-.exit   bsr     NEW_LINE         ; Else move to next line,
+.exit   bsr     NEW_LINE        ; Else move to next line,
         bra     GET_LINE        ; and repeat this routine
 
 * -- CLEAN_UP -- *
@@ -263,6 +281,8 @@ CLEAN_UP:
         lea     -1(A0),A0       ; Move back pointer
 .eol    cmp.b   #CR,D0          ; Test for line end (carriage return)
         bne     .l1             ; If not CR, then read next char
+        move.b  #LF,(A0)       ; Add an extra LF to indicate the end of line. Fixes buffer overlapping
+
     * Find first param after initial chars
         lea     LNBUFF(A6),A0   ; Restore buffer pointer
 .l3     cmp.b   #CR,(A0)        ; Test for end of line (carriage return)
@@ -330,14 +350,17 @@ SEARCH:
 * Resulting converted longword is placed in PARAMTR(A6) and D1
 * Sets D7 bit 1 if conversion error occurs
 PARAM:
-        movem.l  D2/A0,-(SP)    ; Save state
+        movem.l  D2/A0/A6,-(SP)    ; Save state
+        lea     DATA,A6         ; Pointer to data area
         clr.l   D2              ; Clear input accumulator
         move.l  BUFFPT(A6),A0   ; Get pointer to first parameter in A0
 
 .loop   move.b  (A0)+,D1        ; Get character from line buffer
         cmp.b   #SPACE,D1       ; Test for delimiter
-        beq     .exit           ; and exit
-
+        beq     .exit           ; and exit if found
+        cmp.b   #CR,D1        ; See if next char is carriage return
+        beq     .exit           ; Exit if so
+    * Convert input to ascii
         asl.l   #4,D2           ; Shift accumulated result 4 bits left
         sub.b   #$30,D1         ; Convert ASCII char to hex
         bmi     .error          ; If result less than $30, then not valid hex
@@ -348,16 +371,14 @@ PARAM:
         bgt     .error          ; then exit to non-hex error
 
 .cont   add.b   D1,D2           ; Add latest nybble to total in D2
-        cmp.b   #CR,(A0)        ; See if next char is carriage return
-        beq     .exit           ; Exit if so
-        bra     .loop           ; Otherwise repeat until delimiter found
+        bra     .loop           ; repeat until delimiter found
 .exit   move.l  A0,BUFFPT(A6)   ; Save pointer (to next parameter) in memory
-        move.l  D2,PARAMTR(A6)  ; Save parameter in memory
-        move.l  D2,D1           ; Put parameter in D1 for return
         bra     .end            ; Return without error
 
 .error  or.b    #2,D7           ; Set error flag before return
-.end    movem.l  (SP)+,D2/A0    ; Restore state
+.end    move.l  D2,PARAMTR(A6)  ; Save parameter in memory
+        move.l  D2,D1           ; Put parameter in D1 for return (could be zero)
+        movem.l  (SP)+,D2/A0/A6    ; Restore state
         rts                     ; return (with error if set)
 
 * ------------------ *
@@ -463,6 +484,65 @@ DELAY:
         move.l  (SP)+,D0
         rts
 
+RESTORE:
+* Move the volatile environment from the register frame
+* and transfer to the registers, status, and PC
+* Then transform the stack to look like Group2 exception
+* and return from exception to begin execution at new PC location
+* Can rerun a program suspended after exception
+*   ---------------  <- REG_F(A6)
+*   | D0-D7 (8 L) |
+*   ---------------
+*   | A0-A7 (8 L) |
+*   ---------------
+*   |  SSP (1 L)  |
+*   ---------------
+*   |  SR (1 W)   |
+*   ---------------
+*   |  PC (1 L)   |
+*   ---------------  <- REG_F(A6) + 74
+        lea     REG_F+DATA,A3    ; Point A3 to display frame
+        lea     74(A3),A3       ; now point to end of frame + 4 bytes
+        lea     4(SP),SP        ; Remove return address (from bsr) from stack
+        move.w  #36,D6          ; Counter for 37 words to move
+.loop   move.w  -(A3),-(SP)     ; Move word from register frame to stack
+        dbra    D6,.loop        ; Repeat until entire frame moved
+        movem.l (SP)+,D0-D7     ; Restore data registers from stack
+        movem.l (SP)+,A0-A6     ; Restore address registers from stack
+        lea     8(SP),SP        ; Except SSP/USP so remove those from stack
+        rte                     ; Return from exception to run program 
+                                ; This pops the status register (word)
+                                ; and the new PC (longword)
+
+GROUP2:
+* Deals with group 2 exceptions by
+* Recording the volatile state when the exception occurred
+* into the register display frame in memory
+*          15    WORD    0
+*           --------------    High Addrs
+* SSP ->    | Status Reg |    |
+*           --------------    |
+*           |  PC High   |    V
+*           --------------
+*           |   PC Low   |
+*           -------------
+        movem.l A0-A7/D0-D7,-(SP)   ; Save all registers on the stack
+        move.w  #14,D6              ; Transfer D0-D7, A0-A6 from
+        lea     REG_F+DATA,A0        ; the stack to the display frame
+.loop   move.l  (SP)+,(A0)+         ; Move register from stack to frame
+        dbra    D6,.loop             ; and repeat until D0-D7/A0-A6 moved
+        move.l  USP,A2              ; Get the user stack pointer
+        move.l  A2,(A0)+            ; and move it to A7 position on frame
+        move.l  (SP)+,D0            ; Now transfer the system stack pointer
+        sub.l   #10,D0              ; accounting for the data pushed on the stack
+        move.l  D0,(A0)+            ; up to this point.
+        move.l  (SP)+,A1            ; Copy Subroutine Return address to A1
+        move.w  (SP)+,(A0)+         ; Move Status Register to display frame
+        move.l  (SP)+,D0            ; Get PC of from exception frame in D0
+        ; sub     #2,D0               ; Move back to address that triggered exception
+        move.l  D0,(A0)+            ; Put adjusted PC in display frame
+        jmp     (A1)                ; Return from this subroutine
+
 
 * ---------------------- *
 *    COMMAND ROUTINES    *
@@ -474,6 +554,8 @@ HELP:
         lea     HLP_MSG(PC),A1  ; Load help message string
         bra     PRINT_STR       ; and tail return
 
+* -- CLEAR -- *
+* Sends CTRL-L to clear screen
 CLEAR:
         move.b  #CTRL_L,D1      ; Load CTRL-L char in D1
         bra     PUT_CHAR        ; Send character
@@ -492,6 +574,21 @@ JUMP:
 .err    lea     ER_HEX(PC),A1   ; If error,load error message,
         bra     PRINT_STR       ; print and tail return
 
+* -- GO -- *
+* Go executes a program at the given address argument
+* or from the PC in the register display frame. Setup the
+* display frame with desired starting state.
+GO:
+        bsr     PARAM               ; Get execution address (if any)
+        tst.b   D7                  ; Test for input error
+        beq     .else               ; If error,
+        lea     ER_HEX(PC),A1       ; Load and print error message
+        bra     PRINT_STR
+.else   tst.l   D1                  ; Else check for non-zero argument
+        beq     .run                ; If zero, use PC in register frame
+        move.l  D1,REG_F+70(A6)     ; Else save given address in register frame
+        move.w  #$2000,REG_F+68(A6) ; Store initial status in frame (Supervisor mode retained)
+.run    bsr     RESTORE             ; Restore exits at new PC, removing undesired return address
 
 * -- MEMORY MODIFY -- *
 * Display data at a location specified in parameter
@@ -595,7 +692,7 @@ MEM_DMP:
         lea     DIV_2(PC),A1     ; Load space separator
         bsr     PRINT_STR        ; and print it
 
-        lea     -16(A3),A3      ; Backup A3 16 bytes
+        lea     -16(A3),A3       ; Backup A3 16 bytes
 
     * Inner loop 2 (print data as characters)
         move.w  #15,D6          ; Load loop counter for another 16 loops
@@ -619,23 +716,13 @@ MEM_DMP:
 .er2    lea     ER_MEM(PC),A1
         bra     PRINT_STR
 
-; IS_ASCII:
-; * Check if byte in D1 is in ascii range
-;         cmp.b   #20,D1
-;         blt     .unp
-;         cmp.b   #$7E,D1
-;         ble     .print
-; .unp    or.b    #2,D7
-; .print  rts
-
-
 * -- REGISTERS -- *
 * The state of volatile registers are saved to a frame structure
-* in memory before an exception in execution.
+* in memory before an exception
 *   ---------------
-*   | D0-D7 (7 L) |
+*   | D0-D7 (8 L) |
 *   ---------------
-*   | A0-A6 (6 L) |
+*   | A0-A7 (8 L) |
 *   ---------------
 *   |  SSP (1 L)  |
 *   ---------------
@@ -712,6 +799,7 @@ DISP:
         move.l  32(A5),D1           ; Data address register from frame
         bsr     OUT8X               ; which is 32 byte offset from corresponding D-reg
         bsr     NEW_LINE            ;
+        bsr     NEW_LINE            ; and print it (6 bytes)
         lea     4(A5),A5            ; Increment pointer to next register
         dbra    D6,.loop            ; Repeat until all 8 pairs displayed
     *
@@ -743,7 +831,7 @@ DISP:
 * While executing: D3 - Checksum accumulator, D2 - Byte count to read
 *                  D1 - Current byte read,    A2 - Destination address
 LOAD:
-        ; add.b   #1,ECHO(A6)         ; Disable auto echo
+        add.b   #1,ECHO(A6)         ; Disable auto echo
         bsr     NEW_LINE            ;
         ; bsr     DELAY               ; Wait for host to settle (?)
         ; bsr     DELAY               ;
@@ -822,6 +910,117 @@ LOAD:
         add.b   D1,D3               ; Update checksum
         rts
 
+
+* ------------------ *
+* EXCEPTION ROUTINES *
+* ------------------ *
+
+; BUS_EX:
+;         move.l  A1,-(SP)            ; Save address for printing string
+;         lea     EX_BUS(PC),A1       ; Load exception string
+;         bsr     PRINT_STR           ; and print it
+;         move.l  (SP)+,A1            ; Restore pointer
+;         bra     GROUP1              ; Deal with group 1 exception
+
+ADD_EX:
+
+
+UNI_EX:
+* Uninitiated Exception Vector routine
+        lea     EX_UN(PC),A1    ; Print the message
+        bsr     PRINT_STR
+        bsr     DISP            ; Display the register frame (won't be valid?)
+        bra     WARM            ; Abort
+
+
+
+TRAP_0:
+* Trap #0 can be used to record the state of registers
+* into the register display frame. Display with DISP
+        bsr     GROUP2          ; Save state before exception into register mem frame
+        bsr     RESTORE         ; then return from trap 0 as if nothing changed
+                                ; Restore must use bsr, but modifies return address
+                                ; to PC before exception
+
+TRAP_15:
+* Trap 15 is system calls available to user programs
+* Use D0 to specify the task number
+* Table in README
+.t0     cmp.b   #0,D0           ; D0=0, Print the byte in D1.B
+        bne     .t1
+        bsr     OUT2X
+        rte
+.t1     cmp.b   #1,D0           ; D0=1, Print the word in D1.W
+        bne     .t2
+        bsr     OUT4X
+        rte
+.t2     cmp.b   #2,D0           ; D0=2, Print Lowest 6 bytes in D1
+        bne     .t3
+        bsr     OUT6X
+        rte
+.t3     cmp.b   #3,D0           ; D0=3, Print the longword in D1.L
+        bne     .t4
+        bsr     OUT8X
+        rte
+.t4     cmp.b   #4,D0           ; D0=4, Print newline
+        bne     .t5
+        bsr     NEW_LINE
+        rte
+.t5     cmp.b   #5,D0           ; D0=5, Read single ascii character into D1.B
+        bne     .t6
+        bsr     GET_CHAR
+        rte
+.t6     cmp.b   #6,D0           ; D0=6, Display single ascii character in D1.B
+        bne     .t7
+        bsr     PUT_CHAR
+        rte
+.t7     cmp.b   #7,D0           ; D0=7, Read a hex character into D1
+        bne     .t8             ; All input routines set D7 bit 0 (LSB) on conversion error
+        bsr     HEX
+        rte
+.t8     cmp.b   #8,D0           ; D0=8, Read a hex byte into D1.B
+        bne     .t9
+        bsr     BYTE
+        rte
+.t9     cmp.b   #9,D0           ; D0=9, Read a hex word into D1.W
+        bne     .t10
+        bsr     WORD
+        rte
+.t10    cmp.b   #10,D0          ; D0=10, Read a longword into D1.L
+        bne     .t11
+        bsr     LONGWD
+        rte
+.t11    cmp.b   #11,D0          ; D0=11, Toggle input upper case conversion
+        bne     .t12            ; D1.B=0 (disable), !=0 (enable, default)
+        move.l  A6,-(SP)
+        lea     DATA,A6
+        clr.b   U_CASE(A6)      ; Enable upper case conversion
+        tst.b   D1              ; Disable conversion if D1.B=0
+        bne     .e1
+        add.b   #1,U_CASE(A6)   ; Global flag is "active low", so set !=0 here
+.e1     move.l  (SP)+,A6
+        rte
+.t12    cmp.b   #12,D0          ; D0=12, Toggle keyboard echo.
+        bne     .t13            ; D1.B=0 (disable), !=0 (enabled, default)
+        move.l  A6,-(SP)
+        lea     DATA,A6
+        clr.b   ECHO(A6)        ; Enable keyboard echo
+        tst.b   D1              ; Disable echo if D1.B=0
+        bne     .e2             ;
+        add.b   #1,ECHO(A6)     ; Global flag is "active low", so set !=0 here
+.e2     move.l  (SP)+,A6
+        rte
+.t13    cmp.b   #13,D0          ; D0=13, Display Null terminated string at A1
+        bne     .t14            ; With CR,LF
+        bsr     PRINT_STR
+        bsr     NEW_LINE
+        rte
+.t14    cmp.b   #14,D0          ; D0=14, Display Null terminated string at A1
+        bne     .t15
+        bsr     PRINT_STR
+        rte
+.t15    rte
+
 * ------------------- *
 *    COMMAND TABLE    *
 * ------------------- *
@@ -839,28 +1038,32 @@ COMTAB: DC.B    4,1
         DC.B    'HELP'
         DC.L    HELP-COMTAB
     *
-        DC.B    6,5
+        DC.B    6,1
         DC.B    'CLEAR '
         DC.L    CLEAR-COMTAB
     *
-        DC.B    4,2
-        DC.B    'MM  '
+        DC.B    2,2
+        DC.B    'MM'
         DC.L    MEM_MOD-COMTAB
     *
-        DC.B    4,2
-        DC.B    'MD  '
+        DC.B    2,2
+        DC.B    'MD'
         DC.L    MEM_DMP-COMTAB
     *
-        DC.B    4,2
-        DC.B    'RM  '
+        DC.B    2,1
+        DC.B    'RM'
         DC.L    REG_MOD-COMTAB
     *
-        DC.B    6,4
-        DC.B    'DISP '
+        DC.B    2,1
+        DC.B    'GO'
+        DC.L    GO-COMTAB
+    *
+        DC.B    4,1
+        DC.B    'DISP'
         DC.L    DISP-COMTAB
     *
-        DC.B    6,4
-        DC.B    'LOAD  '
+        DC.B    4,4
+        DC.B    'LOAD'
         DC.L    LOAD-COMTAB
     *
         DC.B    4,3
@@ -881,8 +1084,7 @@ LF:         EQU     $0A     ; Line Feed
 ESC:        EQU     $1B     ; Escape
 SPACE:      EQU     $20     ; Space
 NUL:        EQU     $00     ; Null
-CTRL_A:     EQU     $01     ; Quits line editing
-CTRL_C:     EQU     $03     ; Quits line editing
+CTRL_C:     EQU     $03     ; Quits line editing (ETX)
 CTRL_L:     EQU     $0C     ; Clear console
 EOT:        EQU     $04     ; End-of-Transmission ctrl^d
 
@@ -910,23 +1112,24 @@ HLP_MSG:
         DC.B    CR,LF,'    `',$27,$27,$27,'       `\__   /\'
         DC.B    CR,LF,'               ',$27,')'
         DC.B    CR,LF,'COMMANDS:'
-        DC.B    CR,LF,'> DISP                 - Display Registers, PC, and Status'
-        DC.B    CR,LF,'> RM   <reg>  <value>  - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
-        DC.B    CR,LF,'> MM   <address>  - Modify data in any writable location (some is protected)'
-        DC.B    CR,LF,'> MD   <addr1> [addr2] - Print a block of formatted data from any readable location'
-        DC.B    CR,LF,'> LOAD (string) - Load S-Record data over serial port. "string" is sent to host'
-        DC.B    CR,LF,'> JMP  <address> - Begin execution at provided address'
-        ; DC.B    CR,LF,'> [T]             - Execute program in RAM'
-        DC.B    CR,LF,'> CLEAR         - Clear the screen'
-        DC.B    CR,LF,'> HELP          - Display this message'
+        DC.B    CR,LF,'> DISP                   - Display Registers, PC, and Status'
+        DC.B    CR,LF,'> RM   <reg>  <value>    - Set a new value for any of D0-D7, A0-A7, SS, SR, PC'
+        DC.B    CR,LF,'> GO   [addr]            - Executes program at supplied address or from PC. Preset state using RM.'
+        DC.B    CR,LF,'> MM   <addr>            - Modify data in any writable location (some is protected)'
+        DC.B    CR,LF,'> MD   <addr1> [addr2]   - Print a block of formatted data from any readable location'
+        DC.B    CR,LF,'> LOAD (string)          - Load S-Record data over serial port. "string" is sent to host'
+        DC.B    CR,LF,'> JMP  <address>         - Begin execution at provided address (debug only, use GO instead)'
+        DC.B    CR,LF,'> CLEAR                  - Clear the screen'
+        DC.B    CR,LF,'> HELP                   - Display this message'
         DC.B    CR,LF
+        DC.B    CR,LF,'CTRL-C can be used to terminate many commands'
         DC.B    CR,LF,'Created for the final project of Microcomputer Design, 2022'
         DC.B    CR,LF,'Author: Jackson Miller'
         DC.B    CR,LF,'Website: www.github.com/jack-mil/mcd-asm',0
 
 DISP_MSG:
-        DC.B    CR,LF,'  Data reg         Address reg',CR,LF,0
-SP_10:  DC.B    '          ',0
+        DC.B    CR,LF,'  Data reg      Address reg',CR,LF,0
+SP_10:  DC.B    '        ',0
 D_MSG1: DC.B    'SSP =',0
 D_MSG2: DC.B    'SR  =',0
 D_MSG3: DC.B    'PC  =',0
@@ -944,6 +1147,10 @@ ER_REG: DC.B    CR,LF,'Invalid register name',CR,LF,0
 ER_MEM: DC.B    CR,LF,'Invalid memory access',CR,LF,0
 ER_LOD: DC.B    CR,LF,'Load error (Checksum invalid) ',CR,LF,0
 
+EX_BUS: DC.B    CR,LF,'Bus error exception',CR,LF,0
+EX_UN:  DC.B    CR,LF,'Uninitialized exception',CR,LF,0
+
+
 * Register name pairs are used for matching parameters for RM command
         DS.W    0       ; Force even word alignment here
 REGS:   DC.B    'D0D1D2D3D4D5D6D7'
@@ -952,3 +1159,9 @@ REGS:   DC.B    'D0D1D2D3D4D5D6D7'
 * ---------------------- *
     END RESET
 
+
+
+*~Font name~Courier New~
+*~Font size~10~
+*~Tab type~1~
+*~Tab size~4~
