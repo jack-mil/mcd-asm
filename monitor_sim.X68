@@ -747,7 +747,7 @@ REG_MOD:
     * Loop setup
         clr.l   D2              ; D2 stores index of matched register
         lea     REGS(PC),A0     ; A0 points to string of register names
-        ; lea     (A0),A1         ; Copy A0 to A1 as well (?)
+        ; lea     (A0),A1       ; Copy A0 to A1 as well (?)
 .loop   cmp.w   (A0)+,D1        ; Compare character pair to parameter in D1
         beq     .found          ; If match found then exit loop
         add.l   #1,D2           ; Else increment match counter
@@ -765,14 +765,17 @@ REG_MOD:
 .calc   lea     (A1,D2),A2      ; Calculate address of entry in display table
         move.l  (A2),D1         ; Get old contents
         bsr     OUT8X           ; and display them
-        bsr     NEW_LINE
+        lea     SEP(PC),A1      ; Print arrow to new value
+        bsr     PRINT_STR
         bsr     PARAM           ; Get new value
         tst.b   D7              ; Test for input error
         beq     .store          ; If no error then goto store data
         lea     ER_HEX(PC),A1   ; Else, load error message
         bra     PRINT_STR       ; Display and tail return
     * Store 'register' value in frame
-.store  cmp.l   #68,D2          ; If the Status Register was selected then
+.store  bsr     OUT8X           ; Print new contents
+        bsr     NEW_LINE
+        cmp.l   #68,D2          ; If the Status Register was selected then
         beq     .word           ; only a word to store
         move.l  D1,(A2)         ; Else store new data in memory frame
         rts
@@ -796,9 +799,8 @@ DISP:
         bsr     OUT8X               ; and display it
         lea     SP_10(PC),A1        ; Point to spaces
         bsr     PRINT_STR           ; and print it
-        move.l  32(A5),D1           ; Data address register from frame
-        bsr     OUT8X               ; which is 32 byte offset from corresponding D-reg
-        bsr     NEW_LINE            ;
+        move.l  32(A5),D1           ; Get data address register from frame
+        bsr     OUT6X               ; which is 32 byte offset from corresponding D-reg
         bsr     NEW_LINE            ; and print it (6 bytes)
         lea     4(A5),A5            ; Increment pointer to next register
         dbra    D6,.loop            ; Repeat until all 8 pairs displayed
@@ -1129,6 +1131,7 @@ HLP_MSG:
 
 DISP_MSG:
         DC.B    CR,LF,'  Data reg      Address reg',CR,LF,0
+SEP:    DC.B    ' => ',0
 SP_10:  DC.B    '        ',0
 D_MSG1: DC.B    'SSP =',0
 D_MSG2: DC.B    'SR  =',0
