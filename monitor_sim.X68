@@ -135,17 +135,20 @@ INIT_SERIAL:
 *   D1 - ASCII byte to send
 PUT_CHAR:
         movem.l  D0/A0,-(SP)     ; save state
-    IF.B    sim <EQ> #0 THEN.L
+
+    IFNE sim                    ; Only compile on sim=1
+        move.l  #06,D0          ; setup task 6, Display single ASCII char in D1
+        trap    #15             ; call trap #15
+        bra     .exit           ; Skip DUART interaction
+    ENDC
+
+    * Poll Duart Tx
         lea     DUART,A0        ; load pointer to DUART memory
 .wait   btst    #tx_rdy,SRA(A0) ; poll Tx status register
         beq     .wait           ; wait until Tx is ready
         move.b  D1,HRA(A0)      ; move byte to tx holding register A
 
-    ELSE
-        move.l  #06,D0          ; setup task 6, Display single ASCII char in D1
-        trap    #15             ; call trap #15
-    ENDI
-        movem.l (SP)+,D0/A0     ; restore state
+.exit   movem.l (SP)+,D0/A0     ; restore state
         rts
 
 * -- GET_CHAR -- *
@@ -154,30 +157,36 @@ PUT_CHAR:
 * after execution:
 *   D1 - Byte received
 GET_CHAR:
-        movem.l  D0/A0/A6,-(SP)     ; save D0
+        movem.l  D0/A0/A6,-(SP) ; save state
         lea     DATA,A6         ; Pointer to data area
-    IF.B SIM <EQ> #0 THEN.L
+
+    IFNE sim
+        move.l  #05,D0          ; setup trask 5, Read single ASCII character into D1
+        trap    #15             ; call trap #15
+        bra     .proc           ; Skip duart interaction
+    ENDC
+
+    * DUART Rx Polling
         lea     DUART,A0        ; load pointer to DUART memory
 .wait   btst    #Rx_rdy,SRA(A0) ; poll Rx status register
         beq     .wait           ; wait until Rx received
         move.b  HRA(A0),D1      ; Get byte from holding into D1
-    ELSE
-        move.l  #05,D0          ; setup trask 5, Read single ASCII character into D1
-        trap    #15             ; call trap #15
-    ENDI
 
-        and.b   #$7F,D1         ; Strip MSB of input (ASCII is 7-bit)
-    * Convert case
-        tst.b   U_CASE(A6)      ; Test for conversion required
-        bne     .echo           ; If not set, skip conversion
-        btst    #6,D1           ; Test input for lower-case
-        beq     .echo           ; If already upper, skip conversion
-        and.b   #%11011111,D1   ; Else clear bit 5 for upper case conversion
+    * Process received byte in D1
+.proc   and.b   #$7F,D1         ; Strip MSB of input (ASCII is 7-bit)
     * Echo input
-.echo   tst.b   ECHO(A6)        ; Test is echo input set
-        bne.s   .exit           ; If ECHO global var not clear then no echo
+        tst.b   ECHO(A6)        ; Test if echo input set
+        bne     .conv           ; If ECHO global var not clear then no echo
         bsr     PUT_CHAR        ; Else software echo the input (look into loopback later)
-.exit   movem.l  (SP)+,D0/A0/A6    ; Restore state
+    * Convert case
+.conv   tst.b   U_CASE(A6)      ; Test for conversion required
+        bne     .exit           ; If not set, skip conversion
+        cmp.b   #$60,D1         ; Check for bounds of alpha
+        bls     .exit           ; characters.
+        cmp.b   #$7A,D1         ; from 0x61 (a) - 0x7A (z)
+        bhi     .exit
+        and.b   #%11011111,D1   ; Else clear bit 5 for upper case conversion
+.exit   movem.l  (SP)+,D0/A0/A6 ; Restore state
         rts                     ; and return
 
 
@@ -231,16 +240,18 @@ GET_LINE:
         lea     (A1),A3         ; A3 points to start (initially)
         lea     MAXCHR(A1),A2   ; A2 points to end of buffer
     * Print prompt
-        lea     PS1(PC),A1    ; Load prompt string
+        lea     PS1(PC),A1      ; Load prompt string
         bsr     PRINT_STR       ; and print it
     * Loop start
 .cont   bsr     GET_CHAR        ; Receive a character in D1.
         cmp.b   #CTRL_C,D1      ; If CTRL^A then reject this line
         beq     .exit           ; and get another line.
         cmp.b   #BS,D1          ; If backspace then move back pointer
-        bne     .proc           ; else skip past delete steps
+        beq     .del            ; else skip past delete steps
+        cmp.b   #LA,D1
+        bne     .proc
         * Delete Steps
-        cmp.l   A1,A3           ; Check if buffer is already empty.
+.del    cmp.l   A1,A3           ; Check if buffer is already empty.
         beq     .cont           ; If it is, get a new character.
         lea     -1(A3),A3       ; Else decrement buffer pointer (delete the char)
         bra     .cont           ; and continue with next character
@@ -763,9 +774,14 @@ REG_MOD:
         bne     .calc           ; If not PC then finished
         sub.l   #2,D2           ; Else decrement by 2 because SR is a word (2 bytes)
 .calc   lea     (A1,D2),A2      ; Calculate address of entry in display table
-        move.l  (A2),D1         ; Get old contents
+        cmp.l   #68,D2          ; If Sr was selected,
+        beq     .sr             ; only display a word
+        move.l  (A2),D1         ; Else, Get old longword contents
         bsr     OUT8X           ; and display them
-        lea     SEP(PC),A1      ; Print arrow to new value
+        bra     .else
+.sr     move.w  (A2),D1         ; Get SR (word) old contents
+        bsr     OUT4X           ; and display them
+.else   lea     SEP(PC),A1      ; Print arrow to new value
         bsr     PRINT_STR
         bsr     PARAM           ; Get new value
         tst.b   D7              ; Test for input error
@@ -852,10 +868,16 @@ LOAD:
         bne     .next               ; Must start with S1/S2 (data) or S9/S8 (termination)
         bsr     GET_CHAR            ; Get character after the 'S'
         cmp.b   #'9',D1             ; Test for S9 or S8 terminators
-        beq     .exit               ; If S9 type then check for errors and exit
+        beq     .term               ; If S9 type then check for errors and exit
         cmp.b   #'8',D1             ; else test for S8 type, fall through to exit
         bne     .data               ; else goto process data type record
-    * Load exit point
+    * Cleanup end of S8 or S9 record
+.term   bsr     .read1              ; Get the length of the record into D1
+        move.b  D1,D6               ; save length in D6
+.l1     bsr     .read1              ;  Read rest of S8/S9 record
+        sub.b   #1,D6               ;
+        bne     .l1                 ; then fall through to exit
+    * Command exit point
 .exit   clr.b   ECHO(A6)            ; Enable automatic echo
         btst    #0,D7               ; Test for input error
         beq     .chk                ; If no input error, check checksum error
@@ -872,7 +894,7 @@ LOAD:
         cmp.b   #'2',D1             ; Else test for S2 record
         bne     .next               ; If unsupported type, skip to next one
     * Process 3-byte addr for S2 type record
-        clr.b   D3                  ; Else S2 type. Clear initial checksum
+.s2     clr.b   D3                  ; Else S2 type. Clear initial checksum
         bsr     .read1              ; Get the record length in D1
         sub.b   #4,D1               ; Subtract 4 from record length (3 byte address, 1 chksum)
         move.b  D1,D2               ; D2 holds byte count to be read
@@ -1080,7 +1102,8 @@ COMTAB: DC.B    4,1
 * ---------------------- *
 
 * -- Symbol equates -- *
-BS:         EQU     $08     ; Backspace
+BS:         EQU     $7F     ; Destructive Backspace (CTRL-?)/DEL
+LA:         EQU     $08     ; Putty non-destructive backspace (left arrow)
 CR:         EQU     $0D     ; Carriage Return
 LF:         EQU     $0A     ; Line Feed
 ESC:        EQU     $1B     ; Escape
@@ -1138,7 +1161,7 @@ D_MSG2: DC.B    'SR  =',0
 D_MSG3: DC.B    'PC  =',0
 
 MM_ERR: DC.B    CR,LF,'Syntax: MM <addr>. Must be within RAM 010000 - 01FFFF',CR,LF,0
-MM_MSG: DC.B    '[BACKSP] previous byte | [ENTER] next byte | [ESC] to exit',0
+MM_MSG: DC.B    '[BACK] previous byte | [ENTER] next byte | [CTRL-C] to exit',0
 
 MD_MSG: DC.B    CR,LF,'Address:   00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F     0123456789ABCDEF',CR,LF,0
 DIV_1:  DC.B    '  |  ',0
@@ -1150,7 +1173,10 @@ ER_REG: DC.B    CR,LF,'Invalid register name',CR,LF,0
 ER_MEM: DC.B    CR,LF,'Invalid memory access',CR,LF,0
 ER_LOD: DC.B    CR,LF,'Load error (Checksum invalid) ',CR,LF,0
 
-EX_BUS: DC.B    CR,LF,'Bus error exception',CR,LF,0
+EX_BUS: DC.B    CR,LF,'Bus Error exception',CR,LF,0
+EX_ADD: DC.B    CR,LF,'Address Error exception',CR,LF,0
+EX_Il:  DC.B    CR,LF,'Illegal Instruction exception',CR,LF,0
+EX_DIV: DC.B    CR,LF,'Divide by Zero exception',CR,LF,0
 EX_UN:  DC.B    CR,LF,'Uninitialized exception',CR,LF,0
 
 
