@@ -1,7 +1,7 @@
 # KOMODO Monitor Program #
 
 # TODO #
- - [ ] User/Super mode?
+ - [ ] Save last loaded program start location, use with `GO` when no arguments
 
 Program memory Structure
 |    Address | Purpose                                      |
@@ -27,7 +27,13 @@ Many subroutines set flags in D7 to indicate error
 |   2    | S-Record checksum error |
 
 
+### TRAP    #0 ###
+Used to terminate programs running in user mode.
+Use like C's return from main() or exit().
+
+### TRAP    #15 ###
 System Calls available with TRAP    #15
+
 Put task number in D0.B
 | Task  | Usage                                                                                   |
 | :---: | :-------------------------------------------------------------------------------------- |

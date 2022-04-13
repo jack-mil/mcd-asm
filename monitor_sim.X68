@@ -1,7 +1,7 @@
 * ------------------- *
-* M68k system monitor
-* jackmil
-* MCD 2022
+* M68k system monitor *
+* jackmil             *
+* MCD 2022            *
 * ------------------- *
 
 * -- Device addresses -- *
@@ -26,8 +26,7 @@ PROG:       DS.L    1           ; Start address of last program loaded
 
 
 * -- Simulator select bit -- *
-sim:        EQU     $0         ; 1 -> simulator / 0 -> hardware
-
+sim:        EQU     $0              ; 1 -> simulator / 0 -> hardware
 * --------------------------------- *
 *       Exception Vector Table      *
 * --------------------------------- *
@@ -45,7 +44,7 @@ sim:        EQU     $0         ; 1 -> simulator / 0 -> hardware
         ORG     $0BC
         DC.L    TRAP_15             ; Trap #15 provides system calls, see README table
 
-RESET:  ORG     $08000              ; Cold entry point for monitor
+RESET:  ORG     $12000              ; Cold entry point for monitor
 
     * Compiled on simulator only
     IFNE sim                    ; Disable keyboard echo on simulator
@@ -133,11 +132,11 @@ INIT_SERIAL:
         rts
 
 * -- PUT_CHAR -- *
-* Transmit a single character over serial
+* Transmit a single character (byte) over serial
 * parameters:
-*   D1 - ASCII byte to send
+*   D1 - byte to send
 PUT_CHAR:
-        movem.l  D0/A0,-(SP)     ; save state
+        movem.l  D0/A0,-(SP)    ; save state
 
     IFNE sim                    ; Only compile on sim=1
         move.l  #06,D0          ; setup task 6, Display single ASCII char in D1
@@ -238,18 +237,22 @@ PRINT_STR:
 *   A1 points to start of buffer
 *   D1 holds character to be stored
 GET_LINE:
+    * Print prompt
+        lea     PS1(PC),A1      ; Load prompt string
+        bsr     PRINT_STR       ; and print it
     * Setup
         lea     LNBUFF(A6),A1   ; A1 points to start of line
         lea     (A1),A3         ; A3 points to start (initially)
         lea     MAXCHR(A1),A2   ; A2 points to end of buffer
-    * Print prompt
-        lea     PS1(PC),A1      ; Load prompt string
-        bsr     PRINT_STR       ; and print it
     * Loop start
 .cont   bsr     GET_CHAR        ; Receive a character in D1.
         cmp.b   #CTRL_C,D1      ; If CTRL^A then reject this line
         beq     .exit           ; and get another line.
-        cmp.b   #BS,D1          ; If backspace then move back pointer
+        cmp.b   #CR,D1          ; Also if [ENTER] and the
+        bne     .sk1            ; line is empty,
+        cmp.l   A1,A3           ; skip to next line
+        beq     .exit
+.sk1    cmp.b   #BS,D1          ; If backspace then move back pointer
         beq     .del            ; else skip past delete steps
         cmp.b   #LA,D1          ; Works for both 127 and 08 chars
         bne     .proc
@@ -519,6 +522,19 @@ CLEAR_ALL:
         move.l   D0,A4
         move.l   D0,A5
         move.l   D0,A6
+
+        movem.l A0-A7/D0-D7,-(SP)   ; Save all registers on the stack
+        move.w  #14,D6              ; Transfer D0-D7, A0-A6 from
+        lea     DATA+REG_F,A0       ; the stack to the display frame
+.loop   move.l  (SP)+,(A0)+         ; Move register from stack to frame
+        dbra    D6,.loop            ; and repeat until D0-D7/A0-A6 moved
+        move.l  USP,A2              ; Get the user stack pointer
+        move.l  A2,(A0)+            ; and move it to A7 position on frame
+        move.l  (SP)+,D0            ; Now transfer the system stack pointer
+        sub.l   #10,D0              ; accounting for the data pushed on the stack
+        move.l  D0,(A0)+            ; up to this point.
+        move.w  #$2000,(A0)+        ; Move Status Register to display frame
+        move.l  #$11000,(A0)+       ; Put USER PC in display frame
         rts
 
 * ---------------------- *
@@ -528,8 +544,8 @@ CLEAR_ALL:
 * -- HELP -- *
 * Prints help string and info
 HELP:
-        lea     HLP_MSG(PC),A1  ; Load help message string
-        bra     PRINT_STR       ; and tail return
+        lea     HLP_MSG(PC),A1      ; Load help message string
+        bra     PRINT_STR           ; and tail return
 
 * -- CLEAR -- *
 * Sends CTRL-L to clear screen
@@ -561,11 +577,12 @@ GO:
         beq     .else               ; If error,
         lea     ER_HEX(PC),A1       ; Load and print error message
         bra     PRINT_STR
-.else   tst.l   D1                  ; Else check for non-zero argument
+.else   lea     DATA,A6             ; Ensure D6 points to data area
+        tst.l   D1                  ; Else check for non-zero argument
         beq     .run                ; If zero, use PC in register frame
         move.l  D1,REG_F+70(A6)     ; Else save given address in register frame
-        move.w  #$2000,REG_F+68(A6) ; Store initial status in frame (Supervisor mode retained)
-.run    bsr     RESTORE             ; Restore exits at new PC, removing undesired return address
+.run    move.w  #$0000,REG_F+68(A6) ; Set status register to user mode
+        bsr     RESTORE             ; Restore exits at new PC, removing undesired return address
 
 * -- MEMORY MODIFY -- *
 * Display data at a location specified in parameter
@@ -1030,16 +1047,11 @@ RESTORE:
                                 ; This pops the status register (word)
                                 ; and the new PC (longword)
 
-; SAVE_STATE:
-; * Trap #0 can be used to record the state of registers
-; * into the register display frame. Display with DISP
-;                                 ; Emulates a Group 2 exception stack frame
-;         move.w  #$2000,-(SP)    ; By putting a status on stack (Supervisor bit set)
-;         bsr     GROUP2          ; Save state before exception into register mem frame
-;         ; bsr     RESTORE         ; then return from trap 0 as if nothing changed
-;                                 ; Restore must use bsr, but modifies return address
-;                                 ; to PC before exception
-;         bra     COLD
+TRAP_0:
+* Trap zero suspends a program in user mode,
+* and returns execution to system mode. Like exit()
+        bsr     GROUP2
+        bra     WARM
 
 
 TRAP_15:
@@ -1204,10 +1216,11 @@ BANNER:
         DC.B            CR,LF,CR,LF,'                            Komodo Monitor v0.1.0'
         DC.B            CR,LF,'(Type HELP for help)',CR,LF,0
 
-PS1:  DC.B    '$> ',0
+* Unicode thick right arrow, green
+PS1:  DC.B    ESC,'[32m',$E2,$9D,$AF,$20,ESC,'[m',$00
 
 HLP_MSG:
-        DC.B    CR,LF,'Welcome to the Komodo Monitor v0.1.0 for M68k processor'
+        DC.B    CR,LF,'Welcome to the Komodo Monitor v0.1.5 for M68k processor'
         DC.B    CR,LF
         DC.B    CR,LF,'                       )/_'
         DC.B    CR,LF,'             _.--..---',$22,'-,--c_'
@@ -1267,8 +1280,3 @@ REGS:   DC.B    'D0D1D2D3D4D5D6D7'
         DC.B    'SSSRPC  ',0
 * ---------------------- *
     END RESET
-
-*~Font name~Courier New~
-*~Font size~10~
-*~Tab type~1~
-*~Tab size~4~
