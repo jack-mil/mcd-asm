@@ -55,3 +55,6 @@ Put task number in D0.B
 
 ## Full Hardware Memory Map ##
 ![Memory Map](assets/mem_map.jpg)
+
+### References ###
+> Clements, A. (1997) *Microprocessor Systems Design: 68000 hardware, software, and interfacing*. PWS Publishing Company.
