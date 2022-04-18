@@ -2,6 +2,7 @@
 * M68k system monitor *
 * jackmil             *
 * MCD 2022            *
+* V1.0.0              *
 * ------------------- *
 
 * -- Device addresses -- *
@@ -44,7 +45,7 @@ sim:        EQU     $0              ; 1 -> simulator / 0 -> hardware
         ORG     $0BC
         DC.L    TRAP_15             ; Trap #15 provides system calls, see README table
 
-RESET:  ORG     $12000              ; Cold entry point for monitor
+RESET:  ORG     $8000               ; Cold entry point for monitor
 
     * Compiled on simulator only
     IFNE sim                    ; Disable keyboard echo on simulator
@@ -90,14 +91,14 @@ WARM:   clr.l   D7              ; Warm entry point - clear error flag
 * DUART Device Drivers *
 * -------------------- *
 
-; DUART sub-addresses (odd offset required)
+* DUART sub-addresses (odd offset required)
 MRA             EQU     $1      ; Mode Register A	(if Reading)
 SRA             EQU     $3      ; Status Register A	(if Reading)
 CSRA            EQU     $3      ; Clock Select Register A	(if Writing)
 CRA             EQU     $5      ; Command Register A	(if Writing)
 HRA             EQU     $7      ; Holding Register A (Rx if Read, Tx if Write)
 ACR             EQU     $9      ; Auxiliary Control Register (if Writing)
-; Other DUART definitions
+* Other DUART definitions
 MRA_rst         EQU     $10     ; Reset MRA pointer to MR1A
 RxA_rst         EQU     $20     ; Software reset RxA
 TxA_rst         EQU     $30     ; Software reset TxA
@@ -115,11 +116,11 @@ INIT_SERIAL:
         move.l  A0,-(SP)            ; save state
         lea     DUART,A0            ; load pointer to duart memory
 
-; Perform software reset
+    * Perform software reset
         move.b  #MRA_rst,CRA(A0)    ; RESET mode register pointer
         move.b  #RxA_rst,CRA(A0)    ; Reset Rx channel (and disable)
         move.b  #TxA_rst,CRA(A0)    ; Reset Tx channel (and disable)
-; Initilize
+    * Initilize
         move.b  #BAUD_T2,ACR(A0)    ; Select baud rate table 2
         move.b  #BAUD_RATE,CSRA(A0) ; Select 19.2kHz baud rate Rx/Tx
 
@@ -1213,14 +1214,14 @@ BANNER:
         DC.B            CR,LF,'                    | ',$27,' // _ \| ',$27,'_ ` _ \ / _ \ / _` |/ _ \'
         DC.B            CR,LF,'                    | . \ (_) | | | | | | (_) | (_| | (_) |'
         DC.B            CR,LF,'                    |_|\_\___/|_| |_| |_|\___/ \__,_|\___/'
-        DC.B            CR,LF,CR,LF,'                            Komodo Monitor v0.1.0'
+        DC.B            CR,LF,CR,LF,'                            Komodo Monitor v1.0.0'
         DC.B            CR,LF,'(Type HELP for help)',CR,LF,0
 
 * Unicode thick right arrow, green
 PS1:  DC.B    ESC,'[32m',$E2,$9D,$AF,$20,ESC,'[m',$00
 
 HLP_MSG:
-        DC.B    CR,LF,'Welcome to the Komodo Monitor v0.1.5 for M68k processor'
+        DC.B    CR,LF,'Welcome to the Komodo Monitor v1.0.0 for M68k processor'
         DC.B    CR,LF
         DC.B    CR,LF,'                       )/_'
         DC.B    CR,LF,'             _.--..---',$22,'-,--c_'

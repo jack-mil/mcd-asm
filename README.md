@@ -1,7 +1,14 @@
-# KOMODO Monitor Program #
+# KOMODO Monitor Program V1.0.0 #
 
-# TODO #
+Software component of the single board computer design using a M68000 CPU.
+Hardware designs can be found in the [mcd-pcb repo.](https://github.com/jack-mil/mcd-pcb/)
+### Planned Expansion ###
  - [ ] Save last loaded program start location, use with `GO` when no arguments
+ - [ ] Save list of user loaded programs
+ - [ ] Split into separate files with `INCLUDE` pre-processor directive
+ - [ ] Use hardware UART echo mode (loopback)
+ - [ ] Use UART interrupt mode instead of polling
+ - [ ] Memory management
 
 Program memory Structure
 |    Address | Purpose                                      |
